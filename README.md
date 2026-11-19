@@ -159,7 +159,7 @@ node build.js     # 拼接 src/ → deepseek-unlimited.user.js（约 180KB）
 - `src/core/` — 配置 / 选择器 / 工具 / i18n
 - `src/modules/` — 请求改写与设置面板、工具桥接、占用环、会话搜索、粘贴转 txt、标签页标题、工具条定位
 - `src/assets/official-logo.svg` — 左上角官方标识（构建时内联）
-- `docs/logo.svg` — 项目标识源文件，`docs/logo.png` 由它渲染而来
+- `docs/logo.png` — 项目标识（512×512，README 与脚本 `@icon` 都用它）
 
 问题与建议请开 [Issue](https://github.com/dongyu23/deepseek-unlimited/issues)。
 
