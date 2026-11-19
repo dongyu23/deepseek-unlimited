@@ -37,7 +37,7 @@
 ## 安装
 
 1. 装 [Tampermonkey](https://www.tampermonkey.com/)
-2. 安装 [deepseek-unlimited.user.js](https://github.com/dongyu23/deepseek-unlimited/releases)
+2. 安装 [deepseek-unlimited.user.js](https://raw.githubusercontent.com/dongyu23/deepseek-unlimited/main/deepseek-unlimited.user.js)
 3. 打开 chat-demo → 设置 → **自定义模型** → 填端点/Key/模型名，打开总开关
 
 ## 与 deepseek-enhance 共存
