@@ -360,6 +360,41 @@ var DemoBridge = {
     });
   },
 
+  /* ---------- 首条用户消息的可读文本 ----------
+   * 一条 user 消息的 content 可能是字符串，也可能是块数组——粘贴大段文本触发
+   * 「自动转 txt 附件」之后就是数组（document 块 + text 块）。起名腿、标题兜底、
+   * 搜索腿的 ori_question 三处都要取这段文本，而早前只有搜索腿那份处理了数组、
+   * 另两处只认字符串：粘贴 txt 之后 firstUser0 恒为空 → 起名腿根本不发起，
+   * 兜底截断也取不到东西 → 侧边栏标题一直是空的或奇形怪状（2026-11-19 实测）。
+   * 统一收敛到这一个函数。 */
+  firstUserText: function (messages) {
+    var ms = messages || [];
+    var i, j, m, b;
+    // 第一遍：跨消息找第一个有文字的 text 块（附件可能单独占一条消息，问题在下一条）
+    for (i = 0; i < ms.length; i++) {
+      m = ms[i];
+      if (!m || m.role !== 'user') continue;
+      if (typeof m.content === 'string') { if (m.content.trim()) return m.content; continue; }
+      if (!Array.isArray(m.content)) continue;
+      for (j = 0; j < m.content.length; j++) {
+        b = m.content[j];
+        if (b && b.type === 'text' && b.text && String(b.text).trim()) return String(b.text);
+      }
+    }
+    // 第二遍：整段对话只有附件、一个文字块都没有（粘贴 txt 后直接发送）——
+    // 用文件名顶一下，总比没有标题好
+    for (i = 0; i < ms.length; i++) {
+      m = ms[i];
+      if (!m || m.role !== 'user' || !Array.isArray(m.content)) continue;
+      for (j = 0; j < m.content.length; j++) {
+        b = m.content[j];
+        var nm = b && (b.title || b.name || (b.source && b.source.name));
+        if (nm && String(nm).trim()) return String(nm);
+      }
+    }
+    return '';
+  },
+
   /* ---------- 起名来源（demoTitleSource） ---------- */
   // deepseek=起名腿打 DeepSeek 官方端点（title 参数，官方通道，约 $0.001/次）
   // model=当前自定义模型按提示词起名（费用走第三方端点，不经 DeepSeek）
@@ -513,19 +548,7 @@ var DemoBridge = {
     var outbound = this.buildOutbound(body, init.headers || {});
     // 会话首条用户消息：搜索腿的 ori_question 兜底（官方文档说带上原始问题能改善
     // 查询理解——智能体内部的检索词往往是压缩过的关键词串）
-    self._firstUser = (function () {
-      var ms = (body && body.messages) || [];
-      for (var i = 0; i < ms.length; i++) {
-        var m = ms[i];
-        if (m && m.role === 'user' && typeof m.content === 'string' && m.content.trim()) return m.content;
-        if (m && m.role === 'user' && Array.isArray(m.content)) {
-          for (var j = 0; j < m.content.length; j++) {
-            if (m.content[j] && m.content[j].type === 'text' && m.content[j].text) return m.content[j].text;
-          }
-        }
-      }
-      return '';
-    })();
+    self._firstUser = this.firstUserText(body.messages);
     var enc = new TextEncoder();
     var q = [], done = false, wake = null;
     var push = function (s) { q.push(s); if (wake) { var w = wake; wake = null; w(); } };
@@ -566,11 +589,9 @@ var DemoBridge = {
       var titleSrc = self.titleSource();
       var titleLeg = null;
       if (wantTitle && titleSrc !== 'off') {
-        var firstUser0 = '';
-        for (var fi = 0; fi < (body.messages || []).length; fi++) {
-          var fm = body.messages[fi];
-          if (fm && fm.role === 'user' && typeof fm.content === 'string') { firstUser0 = fm.content; break; }
-        }
+        // 走统一的 firstUserText：粘贴长文本转成 txt 附件后 content 是块数组，
+        // 早前这里只认字符串，导致 firstUser0 恒为空、起名腿根本不发起
+        var firstUser0 = self.firstUserText(body.messages);
         if (firstUser0) {
           titleLeg = (titleSrc === 'model'
             ? self.runTitleLegModel(firstUser0, outbound, ac.signal)
@@ -713,11 +734,10 @@ var DemoBridge = {
           var title = '';
           if (titleLeg) { try { title = (await titleLeg) || ''; } catch (e) { title = ''; } }
           if (!title) {
-            for (var mi = 0; mi < messages.length; mi++) {
-              if (messages[mi].role === 'user' && typeof messages[mi].content === 'string') {
-                title = messages[mi].content.replace(/\s+/g, ' ').trim().slice(0, 20); break;
-              }
-            }
+            // 同样走 firstUserText：早前这里只认字符串，粘贴 txt 之后连兜底
+            // 截断都取不到东西，标题直接是空的
+            var fb = self.firstUserText(messages);
+            if (fb) title = fb.replace(/\s+/g, ' ').trim().slice(0, 20);
           }
           if (title) delta.title = title;
         }

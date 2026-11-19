@@ -223,11 +223,19 @@ var DemoSearch = {
     return out;
   },
 
-  // 一条消息的可搜文本：user=content 字符串；assistant=text 块拼接
-  // （thinking/工具块不搜——官方可见结果同样只有正文）
+  // 一条消息的可搜文本：user=content 字符串或块数组里的 text 块（粘贴长文本
+  // 转成 txt 附件后就是数组，早前只认字符串、那条消息会搜不到）；
+  // assistant=text 块拼接（thinking/工具块不搜——官方可见结果同样只有正文）
   msgText: function (m) {
     if (!m) return '';
-    if (m.role === 'user') return typeof m.content === 'string' ? m.content : '';
+    if (m.role === 'user') {
+      if (typeof m.content === 'string') return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content.filter(function (b) { return b && b.type === 'text'; })
+          .map(function (b) { return b.text || ''; }).join('\n');
+      }
+      return '';
+    }
     return (m.blocks || []).filter(function (b) { return b.type === 'text'; })
       .map(function (b) { return b.text || ''; }).join('\n');
   },
