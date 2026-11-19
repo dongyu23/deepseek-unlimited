@@ -67,15 +67,15 @@ var Utils = {
   },
   rand: function (a, b) { return a + Math.random() * (b - a); },
   toast: function (msg, ms) {
-    var t = document.getElementById('dse-toast');
+    var t = document.getElementById('dcp-toast');
     if (!t) {
-      t = document.createElement('div'); t.id = 'dse-toast';
+      t = document.createElement('div'); t.id = 'dcp-toast';
       document.body.appendChild(t);
     }
     t.textContent = msg;
-    t.className = 'dse-toast-show' + (Utils.isDark() ? ' dse-toast-dark' : '');
+    t.className = 'dcp-toast-show' + (Utils.isDark() ? ' dcp-toast-dark' : '');
     clearTimeout(t._tid);
-    t._tid = setTimeout(function () { t.className = t.className.replace('dse-toast-show', '').trim(); }, ms || 2000);
+    t._tid = setTimeout(function () { t.className = t.className.replace('dcp-toast-show', '').trim(); }, ms || 2000);
   },
   // 派发可信点击（React 受控元素需要完整事件序列）
   realClick: function (el) {

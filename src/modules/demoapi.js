@@ -191,8 +191,17 @@ var DemoApi = {
       if (/^(主题|语言|朗读音色|位置信息)/.test(t) && c.offsetParent !== null) anchor = c;
     });
     if (!anchor) return;
-    var existing = dlg.querySelector('[data-dse-api-wrap]');
-    var navExisting = document.getElementById('dse-demo-tab');
+    // 接管：另一个脚本（deepseek-enhance）也往这个弹窗里注入「自定义模型」面
+    // 板，而且它不管自己开没开自定义模型都会注入——两边用的是同一批 DOM id/
+    // 属性（它那边是 dse- 前缀），谁先注入谁占位，后到的那个 injectUI 会当成
+    // 「已在位」直接早退，面板永远显示不出来。本项目活动时先把对方那一份摘掉，
+    // 用自己的 dcp- 前缀重建，两边各管各的、互不遮挡。
+    var foreign = dlg.querySelector('[data-dse-api-wrap]');
+    if (foreign) foreign.remove();
+    var foreignNav = document.getElementById('dse-demo-tab');
+    if (foreignNav) foreignNav.remove();
+    var existing = dlg.querySelector('[data-dcp-api-wrap]');
+    var navExisting = document.getElementById('dcp-demo-tab');
     if (existing && navExisting && existing.parentElement === content) {
       if (this._tabCtl) this._tabCtl.sync();   // 已在位：只同步显隐状态
       return;
@@ -227,7 +236,7 @@ var DemoApi = {
     var self = this;
     var mkRow = function (labelText, cfgKey, placeholder, title, isPassword, hints, listId) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -235,7 +244,7 @@ var DemoApi = {
       var input = document.createElement('input');
       input.type = isPassword ? 'password' : 'text';
       if (hints && listId) input.setAttribute('list', listId);
-      else if (cfgKey === 'model') input.setAttribute('list', 'dse-model-hints');
+      else if (cfgKey === 'model') input.setAttribute('list', 'dcp-model-hints');
       input.placeholder = placeholder;
       input.value = self.cfg(cfgKey);
       input.title = title;
@@ -261,7 +270,7 @@ var DemoApi = {
     var CHEVRON = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' stroke='%23888' fill='none' stroke-width='1.5' stroke-linecap='round'/></svg>\")";
     var mkSelect = function (labelText, cfgKey, options, defVal, title) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -283,11 +292,11 @@ var DemoApi = {
     };
 
     var wrap = document.createElement('div');
-    wrap.setAttribute('data-dse-api-wrap', '1');
+    wrap.setAttribute('data-dcp-api-wrap', '1');
 
     // 主开关：关=完全官方逻辑（DeepSeek 全套）；开=才允许自定义
     var swRow = document.createElement('div');
-    swRow.setAttribute('data-dse-api-row', 'custom');
+    swRow.setAttribute('data-dcp-api-row', 'custom');
     swRow.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var swLabel = document.createElement('div');
     swLabel.textContent = DCP.t('自定义模型');
@@ -298,9 +307,9 @@ var DemoApi = {
     swKnob.style.cssText = 'position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 3px rgba(0,0,0,.3)';
     swTrack.appendChild(swKnob);
     var cfgBox = document.createElement('div');
-    cfgBox.setAttribute('data-dse-cfg-box', '1');
+    cfgBox.setAttribute('data-dcp-cfg-box', '1');
     var paintSw = function (on) {
-      var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+      var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
       swTrack.style.background = on ? accent : 'rgba(127,127,127,.35)';
       swKnob.style.left = on ? '20px' : '2px';
       cfgBox.style.display = on ? 'block' : 'none';
@@ -330,7 +339,7 @@ var DemoApi = {
     // 布尔开关行（与主开关同款样式）——供高级选项里的布尔配置用
     var mkSwitch = function (labelText, cfgKey, desc) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase + 'cursor:pointer;user-select:none';
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -341,7 +350,7 @@ var DemoApi = {
       knob.style.cssText = swKnob.style.cssText;
       track.appendChild(knob);
       var paint = function (on) {
-        var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+        var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
         track.style.background = on ? accent : 'rgba(127,127,127,.35)';
         knob.style.left = on ? '20px' : '2px';
       };
@@ -362,7 +371,7 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DCP.t('deepseek-flash（官方默认）'),
-      DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+      DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dcp-model-hints'));
     // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
     // 关=换成文字说明——纯文本模型即便收到图也是白烧 token，多半还被拒。
     // 注意 mkSwitch 内部已包 withDesc，这里别再套一层（否则描述渲染两遍）
@@ -375,7 +384,7 @@ var DemoApi = {
      * 点一下冲掉所有未落盘的防抖写入、立即写盘并反馈；左边一句「改动会自动保存」
      * 把真实行为说明白，关不关面板都不会丢 */
     var saveRow = document.createElement('div');
-    saveRow.setAttribute('data-dse-api-row', 'save');
+    saveRow.setAttribute('data-dcp-api-row', 'save');
     saveRow.style.cssText = rowBase + 'margin-top:2px';
     var saveHint = document.createElement('div');
     saveHint.textContent = DCP.t('改动会自动保存，关掉面板也不会丢；点此可立即保存并确认');
@@ -383,7 +392,7 @@ var DemoApi = {
     var saveBtn = document.createElement('button');
     saveBtn.type = 'button';
     saveBtn.textContent = DCP.t('保存');
-    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
     saveBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
       'border-radius:16px;padding:0 20px;font-size:13px;background:' + saveAccent + ';color:#fff;flex:0 0 auto';
     var saveBtnTimer = null;
@@ -406,7 +415,7 @@ var DemoApi = {
     // DeepSeek 会答"我是DeepSeek"，第三方模型会答出自己的真实身份，用户据此
     // 确认切换真的生效了
     var testRow = document.createElement('div');
-    testRow.setAttribute('data-dse-api-row', 'test');
+    testRow.setAttribute('data-dcp-api-row', 'test');
     testRow.style.cssText = rowBase;
     var testLabel = document.createElement('div');
     testLabel.textContent = DCP.t('测试连接与模型身份');
@@ -414,11 +423,11 @@ var DemoApi = {
     var testBtn = document.createElement('button');
     testBtn.type = 'button';
     testBtn.textContent = DCP.t('测试');
-    var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
     testBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
       'border-radius:16px;padding:0 18px;font-size:13px;background:' + accent + ';color:#fff;flex:0 0 auto';
     var testResult = document.createElement('div');
-    testResult.setAttribute('data-dse-test-result', '1');
+    testResult.setAttribute('data-dcp-test-result', '1');
     testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:11px;line-height:1.5;padding:1px 0 6px;white-space:pre-wrap;word-break:break-all';
     testBtn.addEventListener('click', function () {
       testResult.style.display = 'block';
@@ -468,7 +477,7 @@ var DemoApi = {
 
     // 高级选项：默认折叠，配人话说明（这两个是排障开关，不是常规配置）
     var advToggle = document.createElement('div');
-    advToggle.setAttribute('data-dse-api-row', 'advanced');
+    advToggle.setAttribute('data-dcp-api-row', 'advanced');
     advToggle.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var advLabel = document.createElement('div');
     advLabel.textContent = DCP.t('高级选项');
@@ -478,7 +487,7 @@ var DemoApi = {
     advArrow.style.cssText = 'transition:transform .15s;opacity:.6;font-size:16px;width:24px;text-align:center';
     advToggle.appendChild(advLabel); advToggle.appendChild(advArrow);
     var advBox = document.createElement('div');
-    advBox.setAttribute('data-dse-advanced', '1');
+    advBox.setAttribute('data-dcp-advanced', '1');
     advBox.style.display = 'none';
     advToggle.addEventListener('click', function () {
       var open = advBox.style.display !== 'none';
@@ -519,7 +528,7 @@ var DemoApi = {
       });
       document.body.appendChild(dl);
     };
-    mkList('dse-model-hints', this.HINTS);
+    mkList('dcp-model-hints', this.HINTS);
 
     // 配置块作为内容容器的直接子级（与原生行同列，天然对齐）
     content.appendChild(wrap);
@@ -535,7 +544,7 @@ var DemoApi = {
       activeToken = at.filter(function (t) { return t && it.indexOf(t) === -1; })[0] || null;
     }
     var nav = document.createElement('button');
-    nav.id = 'dse-demo-tab';
+    nav.id = 'dcp-demo-tab';
     nav.type = 'button';
     nav.className = refNav.className;
     var navIco = document.createElement('span');
@@ -589,7 +598,7 @@ var DemoApi = {
 
   fixLogo: function () {
     if (location.hostname !== 'cdn.deepseek.com') return;
-    if (document.querySelector('[data-dse-logo]')) return;    // 已替换
+    if (document.querySelector('[data-dcp-logo]')) return;    // 已替换
     // 按文本找应用名元素——类名是 bundle 哈希会变，页面自己的文本稳定
     var el = null;
     Array.prototype.forEach.call(document.querySelectorAll('div,span,a'), function (n) {
@@ -601,7 +610,7 @@ var DemoApi = {
     if (!el) return;
     el.textContent = '';
     var host = document.createElement('span');
-    host.setAttribute('data-dse-logo', '1');
+    host.setAttribute('data-dcp-logo', '1');
     // 与官方一致：品牌色变量随标识自身携带；inline-flex + line-height:0 消除
     // 行内 SVG 的基线间隙
     host.style.cssText = '--dsw-alias-brand-primary:#5686fe;display:inline-flex;line-height:0;vertical-align:middle';

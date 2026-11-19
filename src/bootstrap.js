@@ -6,11 +6,11 @@
 
 /* ---------- 运行时探测：GM 可用用油猴，否则回退 localStorage（WebView 注入） ---------- */
 var HAS_GM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
-var LS_PREFIX = 'dse_store_';
+var LS_PREFIX = 'dcp_store_';
 var lsStore = {};
-try { lsStore = JSON.parse(localStorage.getItem('dse_bridge_store') || '{}') || {}; } catch (e) { lsStore = {}; }
+try { lsStore = JSON.parse(localStorage.getItem('dcp_bridge_store') || '{}') || {}; } catch (e) { lsStore = {}; }
 var lsTimer = null;
-function lsWriteNow() { try { localStorage.setItem('dse_bridge_store', JSON.stringify(lsStore)); } catch (e) {} }
+function lsWriteNow() { try { localStorage.setItem('dcp_bridge_store', JSON.stringify(lsStore)); } catch (e) {} }
 /* 合并写入：粘贴长文本时 input 会连续触发，逐次全量 stringify+写盘会卡死主线程 */
 function lsFlush() {
   if (lsTimer) return;
@@ -46,7 +46,7 @@ var Bridge = {
     var host = document.head || document.documentElement;
     if (!host) { this._pendingCss.push(css); this._scheduleFlush(); return null; }
     var s = document.createElement('style');
-    s.setAttribute('data-dse', '1');
+    s.setAttribute('data-dcp', '1');
     s.textContent = css;
     host.appendChild(s);
     return s;
@@ -61,7 +61,7 @@ var Bridge = {
       var all = self._pendingCss.slice(); self._pendingCss = [];
       all.forEach(function (css) {
         var s = document.createElement('style');
-        s.setAttribute('data-dse', '1'); s.textContent = css; host.appendChild(s);
+        s.setAttribute('data-dcp', '1'); s.textContent = css; host.appendChild(s);
       });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', flush);
@@ -102,6 +102,23 @@ var DCP = window.DCP = {
 try { var pw = pageWindow(); if (pw && pw !== window) pw.DCP = DCP; } catch (e) {}
 
 DCP.register = function (name, api) { this.modules[name] = api || {}; };
+
+/* ---------- 基础变量 ----------
+ * 占用环/进度条读 --dcp-accent 与 --dcp-border。这两个值以前是从另一个脚本
+ * （deepseek-enhance）注入的 --dse-* 借来的——单独装本项目时没有人定义，
+ * SVG 的 stroke 会变成无效值、环直接看不见。故自带一份，取值与官方主站同一
+ * 组品牌色（浅色 #3b6cf6 / 深色 #6b93ff）。 */
+Bridge.addStyle(
+  ':root{--dcp-accent:#3b6cf6;--dcp-border:rgba(0,0,0,.08)}' +
+  'body.dark{--dcp-accent:#6b93ff;--dcp-border:rgba(255,255,255,.10)}' +
+  /* Toast：保存成功/输入框无法识别这类轻反馈。以前也是从另一个脚本的样式表
+   * 借的，单独装时是个没有样式的裸 div，故一并自带 */
+  '#dcp-toast{position:fixed;left:50%;top:max(20px,env(safe-area-inset-top));transform:translate(-50%,-160%);' +
+  'z-index:2147483000;padding:10px 18px;border-radius:999px;font-size:13px;max-width:88vw;' +
+  'background:rgba(28,30,38,.92);color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.25);' +
+  'transition:transform .35s cubic-bezier(.34,1.4,.64,1);pointer-events:none;text-align:center;line-height:1.4}' +
+  '#dcp-toast.dcp-toast-show{transform:translate(-50%,0)}'
+);
 DCP.log = function () {
   var a = ['[DCP]'].concat([].slice.call(arguments));
   try { console.log.apply(console, a); } catch (e) {}

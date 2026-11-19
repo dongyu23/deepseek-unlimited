@@ -41,12 +41,12 @@ var CtxRing = {
 
   inject: function () {
     var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
-    if (!bar || document.getElementById('dse-ctx-ring')) return;
+    if (!bar || document.getElementById('dcp-ctx-ring')) return;
     var C = 2 * Math.PI * this.R;
     var btn = document.createElement('button');
-    btn.id = 'dse-ctx-ring';
+    btn.id = 'dcp-ctx-ring';
     btn.type = 'button';
-    // 不用 .dse-icon-btn（display!important 会压住内联隐藏）；也不给按钮加
+    // 不用 .dcp-icon-btn（display!important 会压住内联隐藏）；也不给按钮加
     // 圆形边框/底色——那会和里面的 SVG 进度环叠成“两个圈”（UI 瑕疵），
     // 保持只有一个环
     btn.style.cssText = 'display:none;align-items:center;justify-content:center;width:24px;height:24px;' +
@@ -55,8 +55,8 @@ var CtxRing = {
     btn.title = '';
     btn.innerHTML =
       '<svg width="' + this.SIZE + '" height="' + this.SIZE + '" viewBox="0 0 ' + this.SIZE + ' ' + this.SIZE + '">' +
-      '<circle cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-border)" stroke-width="2.5"></circle>' +
-      '<circle class="dse-ctx-arc" cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-accent)" ' +
+      '<circle cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dcp-border)" stroke-width="2.5"></circle>' +
+      '<circle class="dcp-ctx-arc" cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dcp-accent)" ' +
       'stroke-width="2.5" stroke-linecap="round" stroke-dasharray="' + C.toFixed(2) + '" stroke-dashoffset="' + C.toFixed(2) + '" ' +
       'transform="rotate(-90 11 11)"></circle></svg>';
     btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); });
@@ -90,15 +90,15 @@ var CtxRing = {
     var used = isObj ? (Number(data.used) || 0) : (Number(data) || 0);
     this._last = used;
     this._data = isObj ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
-    var btn = document.getElementById('dse-ctx-ring') || this.inject();
+    var btn = document.getElementById('dcp-ctx-ring') || this.inject();
     if (!btn) return;
     var limit = this.limit();
     var pct = Math.max(0, Math.min(100, used / limit * 100));
-    var arc = btn.querySelector('.dse-ctx-arc');
+    var arc = btn.querySelector('.dcp-ctx-arc');
     var C = 2 * Math.PI * this.R;
     if (arc) arc.setAttribute('stroke-dashoffset', (C * (1 - pct / 100)).toFixed(2));
     // 颜色分级：>90% 危险 / >70% 警告（与设置面板的 ctx 分级一致）
-    arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)'));
+    arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dcp-accent)'));
     btn.style.display = this.canShow() ? 'inline-flex' : 'none';
     // 富信息悬浮面板替代原生 title
     btn.onmouseenter = function () { self.showPanel(); };
@@ -109,9 +109,9 @@ var CtxRing = {
 
   /* ---------- 悬浮详情面板（ZCode 式：总量+进度条+构成+缓存命中率） ---------- */
   ensurePanel: function () {
-    if (document.getElementById('dse-ctx-panel')) return document.getElementById('dse-ctx-panel');
+    if (document.getElementById('dcp-ctx-panel')) return document.getElementById('dcp-ctx-panel');
     var p = document.createElement('div');
-    p.id = 'dse-ctx-panel';
+    p.id = 'dcp-ctx-panel';
     p.style.cssText = 'position:fixed;z-index:99999;display:none;width:264px;box-sizing:border-box;' +
       'border-radius:14px;padding:14px 16px;font-size:12px;line-height:1.6;' +
       'box-shadow:0 12px 40px rgba(0,0,0,.35);backdrop-filter:blur(20px) saturate(160%);' +
@@ -154,7 +154,7 @@ var CtxRing = {
       (d.estimated ? '，' + DCP.t('估算') : '') + '）</span></div>';
     html += '<div style="height:6px;border-radius:3px;background:' + line + ';overflow:hidden;margin-bottom:10px">' +
       '<div style="height:100%;width:' + pct + '%;border-radius:3px;background:' +
-      (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)')) + '"></div></div>';
+      (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dcp-accent)')) + '"></div></div>';
     rows.forEach(function (r) {
       var pctRow = Math.round(r[1] / estSum * 1000) / 10;
       html += '<div style="display:flex;justify-content:space-between;padding:1px 0">' +
@@ -172,7 +172,7 @@ var CtxRing = {
 
   showPanel: function () {
     var p = this.ensurePanel();
-    var btn = document.getElementById('dse-ctx-ring');
+    var btn = document.getElementById('dcp-ctx-ring');
     if (!btn || !this._data) return;
     this.paintPanel();
     p.style.display = 'block';
@@ -186,7 +186,7 @@ var CtxRing = {
   },
 
   hidePanel: function () {
-    var p = document.getElementById('dse-ctx-panel');
+    var p = document.getElementById('dcp-ctx-panel');
     if (p) p.style.display = 'none';
   },
 
@@ -226,7 +226,7 @@ var CtxRing = {
       // 而 inject() 失败（工具条还没渲染完）时圆圈不存在、新链也走不起来——
       // 结果观察器被全部摘掉且没绑新的，之后只能等 body 节流兜底（实测掉到
       // ~117ms）。保留旧观察器，它们会在下一次变异时继续尝试
-      var ring0 = document.getElementById('dse-ctx-ring');
+      var ring0 = document.getElementById('dcp-ctx-ring');
       if (!ring0) return;
       (self._barMos || []).forEach(function (mo) { try { mo.disconnect(); } catch (e) {} });
       self._barMos = [];
@@ -236,7 +236,7 @@ var CtxRing = {
       while (n && n !== document.body && depth < 8) {
         (function (host) {
           var mo = new MutationObserver(function () {
-            if (document.getElementById('dse-ctx-ring')) return;
+            if (document.getElementById('dcp-ctx-ring')) return;
             self.inject();
             self.update(self._data || self.emptyData());
             bindPrecise();          // 新链可能变了——重新绑
@@ -254,7 +254,7 @@ var CtxRing = {
       // 渲染完成的那一刻就补上。回调本身只是 getElementById 早退，代价可忽略
       if (top) {
         var moTop = new MutationObserver(function () {
-          if (document.getElementById('dse-ctx-ring')) return;
+          if (document.getElementById('dcp-ctx-ring')) return;
           self.inject();
           self.update(self._data || self.emptyData());
           bindPrecise();
@@ -290,7 +290,7 @@ var CtxRing = {
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
       new MutationObserver(Utils.throttle(function () {
-        if (!document.getElementById('dse-ctx-ring')) {
+        if (!document.getElementById('dcp-ctx-ring')) {
           self.inject();
           // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
           // 把构成估算数据清零；没有数据也要画（常驻 0%）

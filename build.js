@@ -25,6 +25,16 @@ const _ver = (header.match(/@version\s+([\d.]+)/) || [])[1] || '0.0.0';
 let body = ORDER.map((f) => '\n/* ===== ' + f + ' ===== */\n' + read(f).trim()).join('\n');
 body = body.replace(/version: '[^']*'/, "version: '" + _ver + "'");
 
+// 资源内联：源码里的 __DCP_XXX__ 占位符替换成 src/assets 下对应文件内容。
+// 官方标识 SVG 只存在于主站 bundle、没有静态 URL，只能随脚本分发——少了这步
+// 左上角会直接渲染出占位符文本（2026-11-19 实测复现）
+const ASSETS = { '__DCP_LOGO_SVG__': 'assets/official-logo.svg' };
+Object.keys(ASSETS).forEach((k) => {
+  const asset = read(ASSETS[k]).trim();
+  if (!body.includes(k)) throw new Error('asset placeholder not found: ' + k);
+  body = body.split(k).join(asset);
+});
+
 const userJs = header + '\n' + body + '\n';
 const meta = header.split('\n').filter((l) => l.startsWith('// ==UserScript==') ||
   l.startsWith('// ==/UserScript==') || /^\/\/\s*@/.test(l)).join('\n') + '\n';

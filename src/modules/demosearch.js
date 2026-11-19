@@ -62,7 +62,7 @@ var DemoSearch = {
       // demo 头部会随侧边栏开合重绘——掉了就补。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动重置，入口迟迟不出现
       new MutationObserver(Utils.throttle(function () {
-        if (!document.getElementById('dse-search-entry')) self.injectEntry();
+        if (!document.getElementById('dcp-search-entry')) self.injectEntry();
       }, 100)).observe(document.body, { childList: true, subtree: true });
       // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
       Utils.onThemeChange(function () { self.paint(); });
@@ -75,7 +75,7 @@ var DemoSearch = {
   // 左侧，是唯一可行且不挤占官方元素的位置
   injectEntry: function () {
     var self = this;
-    if (!this.active() || document.getElementById('dse-search-entry')) return;
+    if (!this.active() || document.getElementById('dcp-search-entry')) return;
     var top = document.querySelector('.top-ac14ac');
     if (!top) return;
     var collapse = Array.from(top.querySelectorAll('button'))
@@ -85,7 +85,7 @@ var DemoSearch = {
     var cs = getComputedStyle(collapse);
     var iconColor = cs.color;
     var btn = document.createElement('button');
-    btn.id = 'dse-search-entry';
+    btn.id = 'dcp-search-entry';
     btn.type = 'button';
     btn.title = DCP.t('搜索对话内容...');
     btn.setAttribute('aria-label', DCP.t('搜索对话内容...'));
@@ -115,13 +115,13 @@ var DemoSearch = {
     var p = this.pal();
 
     var overlay = document.createElement('div');
-    overlay.id = 'dse-search-mask';
+    overlay.id = 'dcp-search-mask';
     overlay.style.cssText = 'position:fixed;inset:0;z-index:' + this.Z_INDEX + ';background:' + p.mask +
       ';backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)';
     overlay.addEventListener('click', function () { self.close(); });
 
     var surface = document.createElement('div');
-    surface.id = 'dse-search-modal';
+    surface.id = 'dcp-search-modal';
     surface.setAttribute('role', 'dialog');
     // font-family:inherit——表单控件（input/button）默认不继承字体，会掉到
     // Arial（实测），整层显式继承页面字体才与官方一致
@@ -153,7 +153,7 @@ var DemoSearch = {
     box.appendChild(ico); box.appendChild(input); box.appendChild(close);
 
     var list = document.createElement('div');
-    list.id = 'dse-search-list';
+    list.id = 'dcp-search-list';
     // 官方实测：滚动容器无 padding，其内层 items 容器 padding 8px 8px 0
     list.style.cssText = 'box-sizing:border-box;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
       'padding:8px 8px 0';
@@ -173,9 +173,9 @@ var DemoSearch = {
     this.overlay.style.background = p.mask;
     this.surface.style.background = p.surface;
     this.input.style.color = p.text;
-    this.list.querySelectorAll('[data-dse-s-text]').forEach(function (el) { el.style.color = p.text; });
-    this.list.querySelectorAll('[data-dse-s-dim]').forEach(function (el) { el.style.color = p.dim; });
-    this.list.querySelectorAll('[data-dse-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
+    this.list.querySelectorAll('[data-dcp-s-text]').forEach(function (el) { el.style.color = p.text; });
+    this.list.querySelectorAll('[data-dcp-s-dim]').forEach(function (el) { el.style.color = p.dim; });
+    this.list.querySelectorAll('[data-dcp-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
   },
 
   open: function () {
@@ -271,7 +271,7 @@ var DemoSearch = {
     var pre = (s > 0 ? '…' : '') + t.slice(s, i);
     var hit = t.slice(i, i + q.length);
     var post = t.slice(i + q.length, e) + (e < t.length ? '…' : '');
-    return Utils.escHtml(pre) + '<span data-dse-s-hit style="font-weight:500">' + Utils.escHtml(hit) + '</span>' + Utils.escHtml(post);
+    return Utils.escHtml(pre) + '<span data-dcp-s-hit style="font-weight:500">' + Utils.escHtml(hit) + '</span>' + Utils.escHtml(post);
   },
 
   fmtDate: function (ts) {
@@ -309,25 +309,25 @@ var DemoSearch = {
       var head = document.createElement('div');
       head.style.cssText = 'display:flex;align-items:center;gap:12px;min-width:0';
       var title = document.createElement('span');
-      title.setAttribute('data-dse-s-text', '1');
+      title.setAttribute('data-dcp-s-text', '1');
       title.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
         'font-size:15px;line-height:25px;color:' + p.text;
       title.textContent = r.title || DCP.t('新对话');
       var date = document.createElement('span');
-      date.setAttribute('data-dse-s-dim', '1');
+      date.setAttribute('data-dcp-s-dim', '1');
       date.style.cssText = 'flex:0 0 auto;font-size:13px;line-height:20px;color:' + p.dim;
       date.textContent = this.fmtDate(r.updatedAt);
       head.appendChild(title); head.appendChild(date);
       // 多命中会话显示「n/m」（官方实测：11px、dim 色、紧跟日期）
       if (r.m > 1) {
         var badge = document.createElement('span');
-        badge.setAttribute('data-dse-s-dim', '1');
+        badge.setAttribute('data-dcp-s-dim', '1');
         badge.style.cssText = 'flex:0 0 auto;font-size:11px;line-height:20px;color:' + p.dim;
         badge.textContent = r.n + '/' + r.m;
         head.appendChild(badge);
       }
       var snip = document.createElement('div');
-      snip.setAttribute('data-dse-s-snippet', '1');
+      snip.setAttribute('data-dcp-s-snippet', '1');
       snip.style.cssText = 'margin-top:2px;font-size:13px;line-height:20px;color:' + p.snippet +
         ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
       snip.innerHTML = this.snippet(r.text, q);

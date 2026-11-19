@@ -27,11 +27,11 @@
 
 /* ---------- 运行时探测：GM 可用用油猴，否则回退 localStorage（WebView 注入） ---------- */
 var HAS_GM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
-var LS_PREFIX = 'dse_store_';
+var LS_PREFIX = 'dcp_store_';
 var lsStore = {};
-try { lsStore = JSON.parse(localStorage.getItem('dse_bridge_store') || '{}') || {}; } catch (e) { lsStore = {}; }
+try { lsStore = JSON.parse(localStorage.getItem('dcp_bridge_store') || '{}') || {}; } catch (e) { lsStore = {}; }
 var lsTimer = null;
-function lsWriteNow() { try { localStorage.setItem('dse_bridge_store', JSON.stringify(lsStore)); } catch (e) {} }
+function lsWriteNow() { try { localStorage.setItem('dcp_bridge_store', JSON.stringify(lsStore)); } catch (e) {} }
 /* 合并写入：粘贴长文本时 input 会连续触发，逐次全量 stringify+写盘会卡死主线程 */
 function lsFlush() {
   if (lsTimer) return;
@@ -67,7 +67,7 @@ var Bridge = {
     var host = document.head || document.documentElement;
     if (!host) { this._pendingCss.push(css); this._scheduleFlush(); return null; }
     var s = document.createElement('style');
-    s.setAttribute('data-dse', '1');
+    s.setAttribute('data-dcp', '1');
     s.textContent = css;
     host.appendChild(s);
     return s;
@@ -82,7 +82,7 @@ var Bridge = {
       var all = self._pendingCss.slice(); self._pendingCss = [];
       all.forEach(function (css) {
         var s = document.createElement('style');
-        s.setAttribute('data-dse', '1'); s.textContent = css; host.appendChild(s);
+        s.setAttribute('data-dcp', '1'); s.textContent = css; host.appendChild(s);
       });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', flush);
@@ -123,6 +123,23 @@ var DCP = window.DCP = {
 try { var pw = pageWindow(); if (pw && pw !== window) pw.DCP = DCP; } catch (e) {}
 
 DCP.register = function (name, api) { this.modules[name] = api || {}; };
+
+/* ---------- 基础变量 ----------
+ * 占用环/进度条读 --dcp-accent 与 --dcp-border。这两个值以前是从另一个脚本
+ * （deepseek-enhance）注入的 --dse-* 借来的——单独装本项目时没有人定义，
+ * SVG 的 stroke 会变成无效值、环直接看不见。故自带一份，取值与官方主站同一
+ * 组品牌色（浅色 #3b6cf6 / 深色 #6b93ff）。 */
+Bridge.addStyle(
+  ':root{--dcp-accent:#3b6cf6;--dcp-border:rgba(0,0,0,.08)}' +
+  'body.dark{--dcp-accent:#6b93ff;--dcp-border:rgba(255,255,255,.10)}' +
+  /* Toast：保存成功/输入框无法识别这类轻反馈。以前也是从另一个脚本的样式表
+   * 借的，单独装时是个没有样式的裸 div，故一并自带 */
+  '#dcp-toast{position:fixed;left:50%;top:max(20px,env(safe-area-inset-top));transform:translate(-50%,-160%);' +
+  'z-index:2147483000;padding:10px 18px;border-radius:999px;font-size:13px;max-width:88vw;' +
+  'background:rgba(28,30,38,.92);color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.25);' +
+  'transition:transform .35s cubic-bezier(.34,1.4,.64,1);pointer-events:none;text-align:center;line-height:1.4}' +
+  '#dcp-toast.dcp-toast-show{transform:translate(-50%,0)}'
+);
 DCP.log = function () {
   var a = ['[DCP]'].concat([].slice.call(arguments));
   try { console.log.apply(console, a); } catch (e) {}
@@ -324,15 +341,15 @@ var Utils = {
   },
   rand: function (a, b) { return a + Math.random() * (b - a); },
   toast: function (msg, ms) {
-    var t = document.getElementById('dse-toast');
+    var t = document.getElementById('dcp-toast');
     if (!t) {
-      t = document.createElement('div'); t.id = 'dse-toast';
+      t = document.createElement('div'); t.id = 'dcp-toast';
       document.body.appendChild(t);
     }
     t.textContent = msg;
-    t.className = 'dse-toast-show' + (Utils.isDark() ? ' dse-toast-dark' : '');
+    t.className = 'dcp-toast-show' + (Utils.isDark() ? ' dcp-toast-dark' : '');
     clearTimeout(t._tid);
-    t._tid = setTimeout(function () { t.className = t.className.replace('dse-toast-show', '').trim(); }, ms || 2000);
+    t._tid = setTimeout(function () { t.className = t.className.replace('dcp-toast-show', '').trim(); }, ms || 2000);
   },
   // 派发可信点击（React 受控元素需要完整事件序列）
   realClick: function (el) {
@@ -784,8 +801,17 @@ var DemoApi = {
       if (/^(主题|语言|朗读音色|位置信息)/.test(t) && c.offsetParent !== null) anchor = c;
     });
     if (!anchor) return;
-    var existing = dlg.querySelector('[data-dse-api-wrap]');
-    var navExisting = document.getElementById('dse-demo-tab');
+    // 接管：另一个脚本（deepseek-enhance）也往这个弹窗里注入「自定义模型」面
+    // 板，而且它不管自己开没开自定义模型都会注入——两边用的是同一批 DOM id/
+    // 属性（它那边是 dse- 前缀），谁先注入谁占位，后到的那个 injectUI 会当成
+    // 「已在位」直接早退，面板永远显示不出来。本项目活动时先把对方那一份摘掉，
+    // 用自己的 dcp- 前缀重建，两边各管各的、互不遮挡。
+    var foreign = dlg.querySelector('[data-dse-api-wrap]');
+    if (foreign) foreign.remove();
+    var foreignNav = document.getElementById('dse-demo-tab');
+    if (foreignNav) foreignNav.remove();
+    var existing = dlg.querySelector('[data-dcp-api-wrap]');
+    var navExisting = document.getElementById('dcp-demo-tab');
     if (existing && navExisting && existing.parentElement === content) {
       if (this._tabCtl) this._tabCtl.sync();   // 已在位：只同步显隐状态
       return;
@@ -820,7 +846,7 @@ var DemoApi = {
     var self = this;
     var mkRow = function (labelText, cfgKey, placeholder, title, isPassword, hints, listId) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -828,7 +854,7 @@ var DemoApi = {
       var input = document.createElement('input');
       input.type = isPassword ? 'password' : 'text';
       if (hints && listId) input.setAttribute('list', listId);
-      else if (cfgKey === 'model') input.setAttribute('list', 'dse-model-hints');
+      else if (cfgKey === 'model') input.setAttribute('list', 'dcp-model-hints');
       input.placeholder = placeholder;
       input.value = self.cfg(cfgKey);
       input.title = title;
@@ -854,7 +880,7 @@ var DemoApi = {
     var CHEVRON = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' stroke='%23888' fill='none' stroke-width='1.5' stroke-linecap='round'/></svg>\")";
     var mkSelect = function (labelText, cfgKey, options, defVal, title) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -876,11 +902,11 @@ var DemoApi = {
     };
 
     var wrap = document.createElement('div');
-    wrap.setAttribute('data-dse-api-wrap', '1');
+    wrap.setAttribute('data-dcp-api-wrap', '1');
 
     // 主开关：关=完全官方逻辑（DeepSeek 全套）；开=才允许自定义
     var swRow = document.createElement('div');
-    swRow.setAttribute('data-dse-api-row', 'custom');
+    swRow.setAttribute('data-dcp-api-row', 'custom');
     swRow.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var swLabel = document.createElement('div');
     swLabel.textContent = DCP.t('自定义模型');
@@ -891,9 +917,9 @@ var DemoApi = {
     swKnob.style.cssText = 'position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 3px rgba(0,0,0,.3)';
     swTrack.appendChild(swKnob);
     var cfgBox = document.createElement('div');
-    cfgBox.setAttribute('data-dse-cfg-box', '1');
+    cfgBox.setAttribute('data-dcp-cfg-box', '1');
     var paintSw = function (on) {
-      var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+      var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
       swTrack.style.background = on ? accent : 'rgba(127,127,127,.35)';
       swKnob.style.left = on ? '20px' : '2px';
       cfgBox.style.display = on ? 'block' : 'none';
@@ -923,7 +949,7 @@ var DemoApi = {
     // 布尔开关行（与主开关同款样式）——供高级选项里的布尔配置用
     var mkSwitch = function (labelText, cfgKey, desc) {
       var row = document.createElement('div');
-      row.setAttribute('data-dse-api-row', cfgKey);
+      row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase + 'cursor:pointer;user-select:none';
       var label = document.createElement('div');
       label.textContent = DCP.t(labelText);
@@ -934,7 +960,7 @@ var DemoApi = {
       knob.style.cssText = swKnob.style.cssText;
       track.appendChild(knob);
       var paint = function (on) {
-        var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+        var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
         track.style.background = on ? accent : 'rgba(127,127,127,.35)';
         knob.style.left = on ? '20px' : '2px';
       };
@@ -955,7 +981,7 @@ var DemoApi = {
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
     cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DCP.t('deepseek-flash（官方默认）'),
-      DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dse-model-hints'));
+      DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dcp-model-hints'));
     // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
     // 关=换成文字说明——纯文本模型即便收到图也是白烧 token，多半还被拒。
     // 注意 mkSwitch 内部已包 withDesc，这里别再套一层（否则描述渲染两遍）
@@ -968,7 +994,7 @@ var DemoApi = {
      * 点一下冲掉所有未落盘的防抖写入、立即写盘并反馈；左边一句「改动会自动保存」
      * 把真实行为说明白，关不关面板都不会丢 */
     var saveRow = document.createElement('div');
-    saveRow.setAttribute('data-dse-api-row', 'save');
+    saveRow.setAttribute('data-dcp-api-row', 'save');
     saveRow.style.cssText = rowBase + 'margin-top:2px';
     var saveHint = document.createElement('div');
     saveHint.textContent = DCP.t('改动会自动保存，关掉面板也不会丢；点此可立即保存并确认');
@@ -976,7 +1002,7 @@ var DemoApi = {
     var saveBtn = document.createElement('button');
     saveBtn.type = 'button';
     saveBtn.textContent = DCP.t('保存');
-    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    var saveAccent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
     saveBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
       'border-radius:16px;padding:0 20px;font-size:13px;background:' + saveAccent + ';color:#fff;flex:0 0 auto';
     var saveBtnTimer = null;
@@ -999,7 +1025,7 @@ var DemoApi = {
     // DeepSeek 会答"我是DeepSeek"，第三方模型会答出自己的真实身份，用户据此
     // 确认切换真的生效了
     var testRow = document.createElement('div');
-    testRow.setAttribute('data-dse-api-row', 'test');
+    testRow.setAttribute('data-dcp-api-row', 'test');
     testRow.style.cssText = rowBase;
     var testLabel = document.createElement('div');
     testLabel.textContent = DCP.t('测试连接与模型身份');
@@ -1007,11 +1033,11 @@ var DemoApi = {
     var testBtn = document.createElement('button');
     testBtn.type = 'button';
     testBtn.textContent = DCP.t('测试');
-    var accent = getComputedStyle(document.documentElement).getPropertyValue('--dse-accent').trim() || '#3b6cf6';
+    var accent = getComputedStyle(document.documentElement).getPropertyValue('--dcp-accent').trim() || '#3b6cf6';
     testBtn.style.cssText = 'box-sizing:border-box;height:32px;border:none;outline:none;cursor:pointer;' +
       'border-radius:16px;padding:0 18px;font-size:13px;background:' + accent + ';color:#fff;flex:0 0 auto';
     var testResult = document.createElement('div');
-    testResult.setAttribute('data-dse-test-result', '1');
+    testResult.setAttribute('data-dcp-test-result', '1');
     testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:11px;line-height:1.5;padding:1px 0 6px;white-space:pre-wrap;word-break:break-all';
     testBtn.addEventListener('click', function () {
       testResult.style.display = 'block';
@@ -1061,7 +1087,7 @@ var DemoApi = {
 
     // 高级选项：默认折叠，配人话说明（这两个是排障开关，不是常规配置）
     var advToggle = document.createElement('div');
-    advToggle.setAttribute('data-dse-api-row', 'advanced');
+    advToggle.setAttribute('data-dcp-api-row', 'advanced');
     advToggle.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var advLabel = document.createElement('div');
     advLabel.textContent = DCP.t('高级选项');
@@ -1071,7 +1097,7 @@ var DemoApi = {
     advArrow.style.cssText = 'transition:transform .15s;opacity:.6;font-size:16px;width:24px;text-align:center';
     advToggle.appendChild(advLabel); advToggle.appendChild(advArrow);
     var advBox = document.createElement('div');
-    advBox.setAttribute('data-dse-advanced', '1');
+    advBox.setAttribute('data-dcp-advanced', '1');
     advBox.style.display = 'none';
     advToggle.addEventListener('click', function () {
       var open = advBox.style.display !== 'none';
@@ -1112,7 +1138,7 @@ var DemoApi = {
       });
       document.body.appendChild(dl);
     };
-    mkList('dse-model-hints', this.HINTS);
+    mkList('dcp-model-hints', this.HINTS);
 
     // 配置块作为内容容器的直接子级（与原生行同列，天然对齐）
     content.appendChild(wrap);
@@ -1128,7 +1154,7 @@ var DemoApi = {
       activeToken = at.filter(function (t) { return t && it.indexOf(t) === -1; })[0] || null;
     }
     var nav = document.createElement('button');
-    nav.id = 'dse-demo-tab';
+    nav.id = 'dcp-demo-tab';
     nav.type = 'button';
     nav.className = refNav.className;
     var navIco = document.createElement('span');
@@ -1178,11 +1204,11 @@ var DemoApi = {
   ICON_TAB: '<svg width="16" height="16" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">' +
     '<path d="M7.06431 5.93342C7.68763 5.93342 8.19307 6.43904 8.19322 7.06233C8.19322 7.68573 7.68772 8.19123 7.06431 8.19123C6.44099 8.19113 5.9354 7.68567 5.9354 7.06233C5.93555 6.43911 6.44108 5.93353 7.06431 5.93342Z" fill="currentColor"></path>' +
     '<path fill-rule="evenodd" clip-rule="evenodd" d="M8.6815 0.963693C10.1169 0.447019 11.6266 0.374829 12.5633 1.31135C13.5 2.24805 13.4277 3.75776 12.911 5.19319C12.7126 5.74431 12.4386 6.31796 12.0965 6.89729C12.4969 7.54638 12.8141 8.19018 13.036 8.80647C13.5527 10.2419 13.6251 11.7516 12.6883 12.6883C11.7516 13.625 10.242 13.5527 8.8065 13.036C8.19022 12.8141 7.54641 12.4969 6.89732 12.0965C6.31797 12.4386 5.74435 12.7125 5.19322 12.911C3.75777 13.4276 2.2481 13.5 1.31138 12.5633C0.374859 11.6266 0.447049 10.1168 0.963724 8.68147C1.17185 8.10338 1.46321 7.50063 1.82896 6.8924C1.52182 6.35711 1.27235 5.82825 1.08872 5.31819C0.572068 3.88278 0.499714 2.37306 1.43638 1.43635C2.37308 0.499655 3.8828 0.572044 5.31822 1.08869C5.82828 1.27232 6.35715 1.5218 6.89243 1.82893C7.50066 1.46318 8.10341 1.17181 8.6815 0.963693ZM11.3573 8.01154C10.9083 8.62253 10.3901 9.22873 9.80943 9.8094C9.22877 10.3901 8.62255 10.9083 8.01158 11.3572C8.4257 11.5841 8.8287 11.7688 9.21275 11.9071C10.5456 12.3868 11.4246 12.2547 11.8397 11.8397C12.2548 11.4246 12.3869 10.5456 11.9071 9.21272C11.7688 8.82866 11.5841 8.42568 11.3573 8.01154ZM2.56529 8.02912C2.37344 8.39322 2.21495 8.74796 2.09263 9.08772C1.61291 10.4204 1.74512 11.2995 2.16001 11.7147C2.57505 12.1297 3.45415 12.2618 4.78697 11.7821C5.11057 11.6656 5.44786 11.5164 5.7938 11.3367C5.249 10.9223 4.70922 10.4533 4.19029 9.9344C3.57578 9.31987 3.03169 8.67633 2.56529 8.02912ZM6.90708 3.2469C6.24065 3.70479 5.5646 4.26321 4.91392 4.91389C4.26325 5.56456 3.70482 6.24063 3.24693 6.90705C3.72674 7.63325 4.32777 8.37459 5.03892 9.08576C5.64943 9.69627 6.28183 10.2265 6.90806 10.6678C7.59368 10.2025 8.2908 9.63076 8.96079 8.96076C9.6308 8.29075 10.2025 7.59366 10.6678 6.90803C10.2265 6.2818 9.69631 5.6494 9.08579 5.03889C8.37462 4.32773 7.63328 3.72672 6.90708 3.2469ZM11.7147 2.15998C11.2996 1.74509 10.4204 1.61288 9.08775 2.0926C8.74835 2.21479 8.39382 2.37271 8.03013 2.56428C8.67728 3.03065 9.31995 3.5758 9.93443 4.19026C10.4534 4.7092 10.9223 5.24896 11.3368 5.79377C11.5164 5.44785 11.6656 5.11052 11.7821 4.78694C12.2618 3.45416 12.1297 2.57502 11.7147 2.15998ZM4.91197 2.2176C3.57922 1.73788 2.70004 1.86995 2.28501 2.28498C1.87001 2.70003 1.73791 3.5792 2.21763 4.91194C2.31709 5.18822 2.44112 5.47427 2.58677 5.7674C3.01931 5.1887 3.51474 4.6158 4.06529 4.06526C4.61584 3.5147 5.18872 3.01928 5.76743 2.58674C5.47431 2.4411 5.18824 2.31706 4.91197 2.2176Z" fill="currentColor"></path></svg>',
-  OFFICIAL_LOGO: '__DCP_LOGO_SVG__',
+  OFFICIAL_LOGO: '<svg width="143" height="23" viewBox="0 0 143 23" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M78.6785 18.6823H77.1078V16.2472H78.6785C79.6513 16.2472 80.6342 16.0047 81.2672 15.3308C81.9009 14.6569 82.14 13.6232 82.14 12.59C82.14 11.5569 81.9109 10.5231 81.2672 9.84981C80.6247 9.17594 79.6513 8.93343 78.6785 8.93343C77.7056 8.93343 76.7228 9.17594 76.0886 9.84981C75.4549 10.5237 75.2158 11.5569 75.2158 12.59V22.5909H72.4605V6.50781H75.2158V7.53204H75.7209C75.7757 7.4689 75.8304 7.41525 75.8857 7.36161C76.5752 6.73244 77.6308 6.50781 78.6684 6.50781C80.2944 6.50781 81.9193 6.91236 82.9849 8.03549C84.0499 9.15861 84.4265 10.8835 84.4265 12.6001C84.4265 14.3166 84.0404 16.0326 82.9849 17.1647C81.9288 18.2967 80.2944 18.6834 78.6785 18.6834V18.6823Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M36.7486 6.94097H38.3188V9.37609H36.7486C35.7753 9.37609 34.7929 9.61859 34.1593 10.2925C33.5257 10.9663 33.2871 12.0001 33.2871 13.0332C33.2871 14.0664 33.5167 15.0996 34.1593 15.7734C34.8019 16.4473 35.7753 16.6898 36.7486 16.6898C37.722 16.6898 38.7049 16.4473 39.3385 15.7734C39.9722 15.0996 40.2108 14.0664 40.2108 13.0332V3.02344H42.9655V19.116H40.2108V18.0918H39.7057C39.6503 18.1544 39.5956 18.2086 39.5403 18.2622C38.8513 18.8908 37.7952 19.116 36.7576 19.116C35.1321 19.116 33.5067 18.712 32.4416 17.5889C31.3766 16.4658 31 14.7403 31 13.0243C31 11.3083 31.3856 9.59177 32.4416 8.45971C33.5067 7.33658 35.1321 6.94097 36.7486 6.94097Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M56.7855 12.8155V13.795H49.4483V11.8454H54.3152C54.2051 11.1358 53.9481 10.4709 53.4887 9.9853C52.8277 9.2846 51.808 9.03316 50.7983 9.03316C49.7886 9.03316 48.7688 9.2846 48.1078 9.9853C47.4468 10.686 47.2076 11.7555 47.2076 12.816C47.2076 13.8766 47.4462 14.9544 48.1078 15.6462C48.7688 16.338 49.788 16.5989 50.7983 16.5989C51.8085 16.5989 52.8277 16.3475 53.4887 15.6462C53.5804 15.5473 53.6631 15.4395 53.7458 15.3316H56.4642C56.2256 16.1765 55.849 16.9403 55.2796 17.5332C54.1777 18.692 52.479 19.1145 50.7983 19.1145C49.1175 19.1145 47.4188 18.701 46.3169 17.5332C45.215 16.3653 44.8111 14.5862 44.8111 12.816C44.8111 11.0458 45.2061 9.25778 46.3169 8.0989C47.4283 6.94001 49.1175 6.51758 50.7983 6.51758C52.479 6.51758 54.1777 6.93107 55.2796 8.0989C56.3904 9.26672 56.7855 11.0458 56.7855 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M70.6151 12.8155V13.795H63.2779V11.8454H68.1448C68.0341 11.1358 67.7776 10.4709 67.3183 9.9853C66.6573 9.2846 65.6376 9.03316 64.6279 9.03316C63.6182 9.03316 62.5984 9.2846 61.9374 9.9853C61.2764 10.686 61.0372 11.7555 61.0372 12.816C61.0372 13.8766 61.2758 14.9544 61.9374 15.6462C62.5984 16.338 63.6182 16.5989 64.6279 16.5989C65.6376 16.5989 66.6573 16.3475 67.3183 15.6462C67.4105 15.5473 67.4927 15.4395 67.5748 15.3316H70.2938C70.0546 16.1765 69.678 16.9403 69.1086 17.5332C68.0067 18.692 66.3081 19.1145 64.6279 19.1145C62.9476 19.1145 61.2484 18.701 60.1465 17.5332C59.0446 16.3653 58.6406 14.5862 58.6406 12.816C58.6406 11.0458 59.0357 9.25778 60.1465 8.0989C61.2579 6.94001 62.9471 6.51758 64.6279 6.51758C66.3086 6.51758 68.0067 6.93107 69.1086 8.0989C70.22 9.26672 70.6151 11.0458 70.6151 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M92.2781 19.1156C93.9589 19.1156 95.657 18.8731 96.7589 18.1813C97.8608 17.4896 98.2653 16.438 98.2653 15.3959C98.2653 14.3538 97.8697 13.2932 96.7589 12.6104C95.657 11.9276 93.9583 11.6756 92.2781 11.6756C91.5612 11.6756 90.9002 11.5767 90.4319 11.3163C89.9637 11.0464 89.7893 10.6424 89.7893 10.2379C89.7893 9.83332 89.9547 9.42039 90.4319 9.15944C90.9002 8.88955 91.626 8.80015 92.3418 8.80015C93.0576 8.80015 93.7834 8.89905 94.2528 9.15944C94.721 9.42933 94.8954 9.83332 94.8954 10.2379H97.6959C97.6959 9.1952 97.3383 8.13522 96.3376 7.4524C95.3368 6.76958 93.803 6.51758 92.2787 6.51758C90.7543 6.51758 89.2211 6.76008 88.2198 7.4524C87.219 8.14416 86.8603 9.1952 86.8603 10.2379C86.8603 11.2805 87.2185 12.3405 88.2198 13.0233C89.2205 13.7061 90.7538 13.9582 92.2787 13.9582C93.0682 13.9582 93.941 14.0571 94.464 14.3174C94.9881 14.5784 95.1714 14.9913 95.1714 15.3959C95.1714 15.8004 94.9881 16.2133 94.464 16.4743C93.941 16.7347 93.142 16.8336 92.3524 16.8336C91.5629 16.8336 90.7543 16.7347 90.2397 16.4743C89.7256 16.2139 89.5323 15.8004 89.5323 15.3959H86.2998C86.2998 16.4385 86.6943 17.4985 87.8063 18.1813C88.9171 18.8641 90.5979 19.1156 92.2787 19.1156H92.2781Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M112.094 12.8155V13.795H104.757V11.8454H109.624C109.514 11.1358 109.257 10.4709 108.798 9.9853C108.136 9.2846 107.117 9.03316 106.106 9.03316C105.095 9.03316 104.077 9.2846 103.416 9.9853C102.755 10.686 102.517 11.7555 102.517 12.816C102.517 13.8766 102.755 14.9544 103.416 15.6462C104.077 16.338 105.097 16.5989 106.106 16.5989C107.116 16.5989 108.136 16.3475 108.798 15.6462C108.889 15.5473 108.972 15.4395 109.054 15.3316H111.772C111.533 16.1765 111.157 16.9403 110.588 17.5332C109.486 18.692 107.787 19.1145 106.106 19.1145C104.425 19.1145 102.727 18.701 101.625 17.5332C100.524 16.3653 100.12 14.5862 100.12 12.816C100.12 11.0458 100.515 9.25778 101.625 8.0989C102.737 6.94001 104.427 6.51758 106.106 6.51758C107.786 6.51758 109.486 6.93107 110.588 8.0989C111.699 9.26672 112.093 11.0458 112.093 12.816L112.094 12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M125.924 12.8155V13.795H118.586V11.8454H123.453C123.344 11.1358 123.086 10.4709 122.627 9.9853C121.966 9.2846 120.947 9.03316 119.936 9.03316C118.926 9.03316 117.907 9.2846 117.246 9.9853C116.585 10.686 116.346 11.7555 116.346 12.816C116.346 13.8766 116.585 14.9544 117.246 15.6462C117.907 16.338 118.927 16.5989 119.936 16.5989C120.946 16.5989 121.966 16.3475 122.627 15.6462C122.719 15.5473 122.801 15.4395 122.885 15.3316H125.602C125.363 16.1765 124.987 16.9403 124.418 17.5332C123.316 18.692 121.617 19.1145 119.936 19.1145C118.256 19.1145 116.558 18.701 115.456 17.5332C114.354 16.3653 113.949 14.5862 113.949 12.816C113.949 11.0458 114.344 9.25778 115.456 8.0989C116.567 6.94001 118.256 6.51758 119.936 6.51758C121.617 6.51758 123.315 6.93107 124.418 8.0989C125.529 9.26672 125.924 11.0458 125.924 12.816V12.8155Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M130.524 3.02344H127.77V19.116H130.524V3.02344Z" fill="var(--dsw-alias-brand-primary)"></path><path d="M135.227 12.4384L139.744 19.1146H136.337L131.819 12.4384L136.337 7.07422H139.744L135.227 12.4384Z" fill="var(--dsw-alias-brand-primary)"></path><g clip-path="url(#clip0_4329_19769)"><path d="M26.5174 3.39471C26.235 3.2567 26.1137 3.52006 25.9487 3.65346C25.8923 3.69659 25.8446 3.75294 25.7969 3.80469C25.3846 4.24516 24.9027 4.53439 24.2737 4.49989C23.3536 4.44814 22.5682 4.73737 21.8735 5.44119C21.7258 4.57349 21.2353 4.0554 20.4889 3.72304C20.0985 3.55054 19.7034 3.37746 19.4297 3.00197C19.2388 2.73459 19.1865 2.43673 19.091 2.14289C19.0301 1.96579 18.9697 1.78466 18.7656 1.75418C18.5442 1.71968 18.4574 1.90541 18.3705 2.06067C18.0232 2.69549 17.8887 3.39471 17.9019 4.10313C17.9324 5.6965 18.6051 6.96556 19.9421 7.86834C20.0939 7.97184 20.133 8.07535 20.0852 8.22658C19.9938 8.53766 19.8857 8.83955 19.7903 9.15063C19.7293 9.34901 19.6385 9.39271 19.4257 9.30588C18.692 8.9994 18.0583 8.54571 17.4982 7.99772C16.5477 7.07827 15.6881 6.06336 14.6162 5.26869C14.3644 5.08296 14.1125 4.91045 13.8521 4.746C12.7584 3.68394 13.9952 2.81164 14.2816 2.70814C14.5812 2.60003 14.3857 2.22857 13.4179 2.23317C12.4502 2.2372 11.5646 2.56151 10.4359 2.99335C10.2708 3.05832 10.0972 3.10547 9.91951 3.14457C8.8954 2.95022 7.83162 2.90709 6.72069 3.03245C4.62877 3.26533 2.95777 4.25436 1.72954 5.94261C0.254043 7.97184 -0.0932679 10.2777 0.33167 12.6824C0.778458 15.2171 2.07225 17.3153 4.06008 18.9558C6.12152 20.6567 8.49577 21.4905 11.2047 21.3306C12.8498 21.2358 14.6812 21.0155 16.7473 19.2669C17.2682 19.5262 17.8151 19.6297 18.7219 19.7074C19.4205 19.7724 20.0933 19.6729 20.6143 19.5648C21.4302 19.3923 21.3739 18.6367 21.0789 18.4981C18.6874 17.3843 19.2124 17.8374 18.7351 17.4706C19.9501 16.033 21.8063 13.4776 22.379 9.99821C22.4353 9.61409 22.5072 9.073 22.4986 8.76192C22.494 8.57216 22.5377 8.49856 22.7545 8.47671C23.3536 8.40771 23.935 8.24383 24.4692 7.94999C26.0188 7.10357 26.6439 5.71318 26.7911 4.04678C26.8129 3.79204 26.7865 3.52869 26.5174 3.39471ZM13.0143 18.3946C10.6964 16.5724 9.5722 15.9726 9.10816 15.9985C8.67402 16.0244 8.75222 16.5212 8.84768 16.8449C8.94773 17.1646 9.07768 17.3849 9.25996 17.6655C9.38589 17.8512 9.47272 18.1272 9.13404 18.3348C8.38766 18.7965 7.08985 18.1796 7.0289 18.1491C5.51833 17.2595 4.25559 16.0853 3.36546 14.4793C2.50581 12.9337 2.0067 11.2753 1.92447 9.50542C1.90262 9.07818 2.02855 8.92695 2.45406 8.84932C3.01413 8.74582 3.59144 8.72397 4.15093 8.80619C6.51656 9.15178 8.53027 10.2092 10.2185 11.8848C11.1822 12.8388 11.9114 13.979 12.6623 15.0929C13.461 16.2757 14.3201 17.4027 15.4144 18.3268C15.8008 18.6505 16.109 18.8966 16.404 19.0783C15.5144 19.1778 14.0297 19.1991 13.0143 18.3958V18.3946ZM14.1252 11.2489C14.1252 11.0591 14.277 10.9079 14.4679 10.9079C14.511 10.9079 14.5501 10.9165 14.5852 10.9292C14.6329 10.9464 14.6766 10.9723 14.7111 11.0114C14.7721 11.0718 14.8066 11.158 14.8066 11.2489C14.8066 11.4386 14.6548 11.5899 14.4639 11.5899C14.273 11.5899 14.1252 11.4386 14.1252 11.2489ZM17.5759 13.0188C17.3545 13.1096 17.1331 13.1873 16.9203 13.1959C16.5903 13.2131 16.2303 13.0791 16.0348 12.9153C15.7312 12.6605 15.5139 12.5179 15.423 12.0734C15.3839 11.8837 15.4057 11.5899 15.4402 11.4214C15.5185 11.0585 15.4316 10.8257 15.1757 10.614C14.9676 10.4415 14.7025 10.3938 14.4115 10.3938C14.3029 10.3938 14.2034 10.3461 14.1292 10.3076C14.0079 10.2472 13.9078 10.096 14.0033 9.91023C14.0338 9.84985 14.1815 9.70322 14.216 9.67734C14.6111 9.45251 15.0665 9.52612 15.488 9.6946C15.8784 9.85445 16.174 10.1477 16.5989 10.5623C17.033 11.0631 17.1112 11.2011 17.3585 11.5772C17.554 11.871 17.7317 12.1729 17.8536 12.5185C17.9272 12.7341 17.8317 12.9107 17.5759 13.0188Z" fill="var(--dsw-alias-brand-primary)"></path></g><defs><clipPath id="clip0_4329_19769"><rect width="26.634" height="19.6" fill="white" transform="translate(0.163086 1.75)"></rect></clipPath></defs></svg>',
 
   fixLogo: function () {
     if (location.hostname !== 'cdn.deepseek.com') return;
-    if (document.querySelector('[data-dse-logo]')) return;    // 已替换
+    if (document.querySelector('[data-dcp-logo]')) return;    // 已替换
     // 按文本找应用名元素——类名是 bundle 哈希会变，页面自己的文本稳定
     var el = null;
     Array.prototype.forEach.call(document.querySelectorAll('div,span,a'), function (n) {
@@ -1194,7 +1220,7 @@ var DemoApi = {
     if (!el) return;
     el.textContent = '';
     var host = document.createElement('span');
-    host.setAttribute('data-dse-logo', '1');
+    host.setAttribute('data-dcp-logo', '1');
     // 与官方一致：品牌色变量随标识自身携带；inline-flex + line-height:0 消除
     // 行内 SVG 的基线间隙
     host.style.cssText = '--dsw-alias-brand-primary:#5686fe;display:inline-flex;line-height:0;vertical-align:middle';
@@ -2032,12 +2058,12 @@ var CtxRing = {
 
   inject: function () {
     var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
-    if (!bar || document.getElementById('dse-ctx-ring')) return;
+    if (!bar || document.getElementById('dcp-ctx-ring')) return;
     var C = 2 * Math.PI * this.R;
     var btn = document.createElement('button');
-    btn.id = 'dse-ctx-ring';
+    btn.id = 'dcp-ctx-ring';
     btn.type = 'button';
-    // 不用 .dse-icon-btn（display!important 会压住内联隐藏）；也不给按钮加
+    // 不用 .dcp-icon-btn（display!important 会压住内联隐藏）；也不给按钮加
     // 圆形边框/底色——那会和里面的 SVG 进度环叠成“两个圈”（UI 瑕疵），
     // 保持只有一个环
     btn.style.cssText = 'display:none;align-items:center;justify-content:center;width:24px;height:24px;' +
@@ -2046,8 +2072,8 @@ var CtxRing = {
     btn.title = '';
     btn.innerHTML =
       '<svg width="' + this.SIZE + '" height="' + this.SIZE + '" viewBox="0 0 ' + this.SIZE + ' ' + this.SIZE + '">' +
-      '<circle cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-border)" stroke-width="2.5"></circle>' +
-      '<circle class="dse-ctx-arc" cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dse-accent)" ' +
+      '<circle cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dcp-border)" stroke-width="2.5"></circle>' +
+      '<circle class="dcp-ctx-arc" cx="11" cy="11" r="' + this.R + '" fill="none" stroke="var(--dcp-accent)" ' +
       'stroke-width="2.5" stroke-linecap="round" stroke-dasharray="' + C.toFixed(2) + '" stroke-dashoffset="' + C.toFixed(2) + '" ' +
       'transform="rotate(-90 11 11)"></circle></svg>';
     btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); });
@@ -2081,15 +2107,15 @@ var CtxRing = {
     var used = isObj ? (Number(data.used) || 0) : (Number(data) || 0);
     this._last = used;
     this._data = isObj ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
-    var btn = document.getElementById('dse-ctx-ring') || this.inject();
+    var btn = document.getElementById('dcp-ctx-ring') || this.inject();
     if (!btn) return;
     var limit = this.limit();
     var pct = Math.max(0, Math.min(100, used / limit * 100));
-    var arc = btn.querySelector('.dse-ctx-arc');
+    var arc = btn.querySelector('.dcp-ctx-arc');
     var C = 2 * Math.PI * this.R;
     if (arc) arc.setAttribute('stroke-dashoffset', (C * (1 - pct / 100)).toFixed(2));
     // 颜色分级：>90% 危险 / >70% 警告（与设置面板的 ctx 分级一致）
-    arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)'));
+    arc.setAttribute('stroke', pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dcp-accent)'));
     btn.style.display = this.canShow() ? 'inline-flex' : 'none';
     // 富信息悬浮面板替代原生 title
     btn.onmouseenter = function () { self.showPanel(); };
@@ -2100,9 +2126,9 @@ var CtxRing = {
 
   /* ---------- 悬浮详情面板（ZCode 式：总量+进度条+构成+缓存命中率） ---------- */
   ensurePanel: function () {
-    if (document.getElementById('dse-ctx-panel')) return document.getElementById('dse-ctx-panel');
+    if (document.getElementById('dcp-ctx-panel')) return document.getElementById('dcp-ctx-panel');
     var p = document.createElement('div');
-    p.id = 'dse-ctx-panel';
+    p.id = 'dcp-ctx-panel';
     p.style.cssText = 'position:fixed;z-index:99999;display:none;width:264px;box-sizing:border-box;' +
       'border-radius:14px;padding:14px 16px;font-size:12px;line-height:1.6;' +
       'box-shadow:0 12px 40px rgba(0,0,0,.35);backdrop-filter:blur(20px) saturate(160%);' +
@@ -2145,7 +2171,7 @@ var CtxRing = {
       (d.estimated ? '，' + DCP.t('估算') : '') + '）</span></div>';
     html += '<div style="height:6px;border-radius:3px;background:' + line + ';overflow:hidden;margin-bottom:10px">' +
       '<div style="height:100%;width:' + pct + '%;border-radius:3px;background:' +
-      (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dse-accent)')) + '"></div></div>';
+      (pct >= 90 ? '#f87171' : (pct >= 70 ? '#fbbf24' : 'var(--dcp-accent)')) + '"></div></div>';
     rows.forEach(function (r) {
       var pctRow = Math.round(r[1] / estSum * 1000) / 10;
       html += '<div style="display:flex;justify-content:space-between;padding:1px 0">' +
@@ -2163,7 +2189,7 @@ var CtxRing = {
 
   showPanel: function () {
     var p = this.ensurePanel();
-    var btn = document.getElementById('dse-ctx-ring');
+    var btn = document.getElementById('dcp-ctx-ring');
     if (!btn || !this._data) return;
     this.paintPanel();
     p.style.display = 'block';
@@ -2177,7 +2203,7 @@ var CtxRing = {
   },
 
   hidePanel: function () {
-    var p = document.getElementById('dse-ctx-panel');
+    var p = document.getElementById('dcp-ctx-panel');
     if (p) p.style.display = 'none';
   },
 
@@ -2217,7 +2243,7 @@ var CtxRing = {
       // 而 inject() 失败（工具条还没渲染完）时圆圈不存在、新链也走不起来——
       // 结果观察器被全部摘掉且没绑新的，之后只能等 body 节流兜底（实测掉到
       // ~117ms）。保留旧观察器，它们会在下一次变异时继续尝试
-      var ring0 = document.getElementById('dse-ctx-ring');
+      var ring0 = document.getElementById('dcp-ctx-ring');
       if (!ring0) return;
       (self._barMos || []).forEach(function (mo) { try { mo.disconnect(); } catch (e) {} });
       self._barMos = [];
@@ -2227,7 +2253,7 @@ var CtxRing = {
       while (n && n !== document.body && depth < 8) {
         (function (host) {
           var mo = new MutationObserver(function () {
-            if (document.getElementById('dse-ctx-ring')) return;
+            if (document.getElementById('dcp-ctx-ring')) return;
             self.inject();
             self.update(self._data || self.emptyData());
             bindPrecise();          // 新链可能变了——重新绑
@@ -2245,7 +2271,7 @@ var CtxRing = {
       // 渲染完成的那一刻就补上。回调本身只是 getElementById 早退，代价可忽略
       if (top) {
         var moTop = new MutationObserver(function () {
-          if (document.getElementById('dse-ctx-ring')) return;
+          if (document.getElementById('dcp-ctx-ring')) return;
           self.inject();
           self.update(self._data || self.emptyData());
           bindPrecise();
@@ -2281,7 +2307,7 @@ var CtxRing = {
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
       new MutationObserver(Utils.throttle(function () {
-        if (!document.getElementById('dse-ctx-ring')) {
+        if (!document.getElementById('dcp-ctx-ring')) {
           self.inject();
           // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
           // 把构成估算数据清零；没有数据也要画（常驻 0%）
@@ -2362,7 +2388,7 @@ var DemoSearch = {
       // demo 头部会随侧边栏开合重绘——掉了就补。节流（带前缘）而非防抖：
       // 防抖会被连续 DOM 变动重置，入口迟迟不出现
       new MutationObserver(Utils.throttle(function () {
-        if (!document.getElementById('dse-search-entry')) self.injectEntry();
+        if (!document.getElementById('dcp-search-entry')) self.injectEntry();
       }, 100)).observe(document.body, { childList: true, subtree: true });
       // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
       Utils.onThemeChange(function () { self.paint(); });
@@ -2375,7 +2401,7 @@ var DemoSearch = {
   // 左侧，是唯一可行且不挤占官方元素的位置
   injectEntry: function () {
     var self = this;
-    if (!this.active() || document.getElementById('dse-search-entry')) return;
+    if (!this.active() || document.getElementById('dcp-search-entry')) return;
     var top = document.querySelector('.top-ac14ac');
     if (!top) return;
     var collapse = Array.from(top.querySelectorAll('button'))
@@ -2385,7 +2411,7 @@ var DemoSearch = {
     var cs = getComputedStyle(collapse);
     var iconColor = cs.color;
     var btn = document.createElement('button');
-    btn.id = 'dse-search-entry';
+    btn.id = 'dcp-search-entry';
     btn.type = 'button';
     btn.title = DCP.t('搜索对话内容...');
     btn.setAttribute('aria-label', DCP.t('搜索对话内容...'));
@@ -2415,13 +2441,13 @@ var DemoSearch = {
     var p = this.pal();
 
     var overlay = document.createElement('div');
-    overlay.id = 'dse-search-mask';
+    overlay.id = 'dcp-search-mask';
     overlay.style.cssText = 'position:fixed;inset:0;z-index:' + this.Z_INDEX + ';background:' + p.mask +
       ';backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)';
     overlay.addEventListener('click', function () { self.close(); });
 
     var surface = document.createElement('div');
-    surface.id = 'dse-search-modal';
+    surface.id = 'dcp-search-modal';
     surface.setAttribute('role', 'dialog');
     // font-family:inherit——表单控件（input/button）默认不继承字体，会掉到
     // Arial（实测），整层显式继承页面字体才与官方一致
@@ -2453,7 +2479,7 @@ var DemoSearch = {
     box.appendChild(ico); box.appendChild(input); box.appendChild(close);
 
     var list = document.createElement('div');
-    list.id = 'dse-search-list';
+    list.id = 'dcp-search-list';
     // 官方实测：滚动容器无 padding，其内层 items 容器 padding 8px 8px 0
     list.style.cssText = 'box-sizing:border-box;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
       'padding:8px 8px 0';
@@ -2473,9 +2499,9 @@ var DemoSearch = {
     this.overlay.style.background = p.mask;
     this.surface.style.background = p.surface;
     this.input.style.color = p.text;
-    this.list.querySelectorAll('[data-dse-s-text]').forEach(function (el) { el.style.color = p.text; });
-    this.list.querySelectorAll('[data-dse-s-dim]').forEach(function (el) { el.style.color = p.dim; });
-    this.list.querySelectorAll('[data-dse-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
+    this.list.querySelectorAll('[data-dcp-s-text]').forEach(function (el) { el.style.color = p.text; });
+    this.list.querySelectorAll('[data-dcp-s-dim]').forEach(function (el) { el.style.color = p.dim; });
+    this.list.querySelectorAll('[data-dcp-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
   },
 
   open: function () {
@@ -2571,7 +2597,7 @@ var DemoSearch = {
     var pre = (s > 0 ? '…' : '') + t.slice(s, i);
     var hit = t.slice(i, i + q.length);
     var post = t.slice(i + q.length, e) + (e < t.length ? '…' : '');
-    return Utils.escHtml(pre) + '<span data-dse-s-hit style="font-weight:500">' + Utils.escHtml(hit) + '</span>' + Utils.escHtml(post);
+    return Utils.escHtml(pre) + '<span data-dcp-s-hit style="font-weight:500">' + Utils.escHtml(hit) + '</span>' + Utils.escHtml(post);
   },
 
   fmtDate: function (ts) {
@@ -2609,25 +2635,25 @@ var DemoSearch = {
       var head = document.createElement('div');
       head.style.cssText = 'display:flex;align-items:center;gap:12px;min-width:0';
       var title = document.createElement('span');
-      title.setAttribute('data-dse-s-text', '1');
+      title.setAttribute('data-dcp-s-text', '1');
       title.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
         'font-size:15px;line-height:25px;color:' + p.text;
       title.textContent = r.title || DCP.t('新对话');
       var date = document.createElement('span');
-      date.setAttribute('data-dse-s-dim', '1');
+      date.setAttribute('data-dcp-s-dim', '1');
       date.style.cssText = 'flex:0 0 auto;font-size:13px;line-height:20px;color:' + p.dim;
       date.textContent = this.fmtDate(r.updatedAt);
       head.appendChild(title); head.appendChild(date);
       // 多命中会话显示「n/m」（官方实测：11px、dim 色、紧跟日期）
       if (r.m > 1) {
         var badge = document.createElement('span');
-        badge.setAttribute('data-dse-s-dim', '1');
+        badge.setAttribute('data-dcp-s-dim', '1');
         badge.style.cssText = 'flex:0 0 auto;font-size:11px;line-height:20px;color:' + p.dim;
         badge.textContent = r.n + '/' + r.m;
         head.appendChild(badge);
       }
       var snip = document.createElement('div');
-      snip.setAttribute('data-dse-s-snippet', '1');
+      snip.setAttribute('data-dcp-s-snippet', '1');
       snip.style.cssText = 'margin-top:2px;font-size:13px;line-height:20px;color:' + p.snippet +
         ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
       snip.innerHTML = this.snippet(r.text, q);
