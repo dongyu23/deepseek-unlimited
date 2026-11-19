@@ -29,8 +29,8 @@ const userJs = header + '\n' + body + '\n';
 const meta = header.split('\n').filter((l) => l.startsWith('// ==UserScript==') ||
   l.startsWith('// ==/UserScript==') || /^\/\/\s*@/.test(l)).join('\n') + '\n';
 
-fs.writeFileSync(path.join(ROOT, 'deepseek-chat-demo-plus.user.js'), userJs);
-fs.writeFileSync(path.join(ROOT, 'deepseek-chat-demo-plus.meta.js'), meta);
+fs.writeFileSync(path.join(ROOT, 'deepseek-unlimited.user.js'), userJs);
+fs.writeFileSync(path.join(ROOT, 'deepseek-unlimited.meta.js'), meta);
 
 // 语法校验
 const tmp = path.join(ROOT, '_check.js');
@@ -38,5 +38,5 @@ fs.writeFileSync(tmp, body);
 try { execSync('node --check "' + tmp + '"', { stdio: 'inherit' }); }
 finally { fs.unlinkSync(tmp); }
 
-console.log('build ok: deepseek-chat-demo-plus.user.js', (userJs.length / 1024).toFixed(1) + 'KB',
+console.log('build ok: deepseek-unlimited.user.js', (userJs.length / 1024).toFixed(1) + 'KB',
   userJs.split('\n').length, 'lines');
