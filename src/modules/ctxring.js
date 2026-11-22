@@ -212,6 +212,33 @@ var CtxRing = {
    * demo 的会话 ID 只存在于 IndexedDB，URL/请求体都不带；DemoSearch.currentSession
    * 会用 active 侧边栏项（收起时用标题 + 可见 user 文本）解析出稳定 ID。
    * ctx:api 到来时按该 ID 写入 dcp_sessions_v1，切回时直接恢复。 */
+  hasSessionDom: function () {
+    var SEL = DCP.SEL || {};
+    if (SEL.chatTitle && document.querySelector(SEL.chatTitle)) return true;
+    if (SEL.sidebarItemActive && document.querySelector(SEL.sidebarItemActive)) return true;
+    return false;
+  },
+
+  resetForNewChat: function () {
+    // pointerdown 与 click 都会走到这里；已经清空时不要再次把 baseSid 覆盖。
+    if (this._newChatPending && this._sessionId === null) return;
+    // 新会话在 IndexedDB 落盘前没有稳定 ID。点击按钮后必须同步清空旧读数，
+    // 否则工具条重建时 MutationObserver 会先用 _data 重绘，短暂或持续显示
+    // 上一会话 token；随后异步 currentSession 也可能先读到尚未清除的旧 DOM。
+    this._syncToken = (this._syncToken || 0) + 1;
+    this._newChatPending = true;
+    this._newChatBaseSid = this._sessionId || null;
+    this._newChatDeadline = Date.now() + 5000;
+    this._sessionId = null;
+    this._last = 0;
+    this._data = this.emptyData();
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    if (tracker && typeof tracker.invalidateRequests === 'function') tracker.invalidateRequests();
+    DCP.emit('session:change', { sessionId: null });
+    this.update(this._data);
+    this.hidePanel();
+  },
+
   syncSession: async function (force) {
     var SEL = DCP.SEL || {};
     var n = SEL.msg ? document.querySelectorAll(SEL.msg).length : 0;
@@ -226,6 +253,20 @@ var CtxRing = {
     var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
     if (token !== this._syncToken) return;
     var sid = session && session.id;
+
+    // 新建会话后的前几次解析可能仍看到旧聊天 DOM/IndexedDB。只要结果还是
+    // 点击前的会话就保持空态，直到真正的新会话落盘；用户主动点其它会话时
+    // 监听器会清除该保护。
+    if (this._newChatPending && sid && sid === this._newChatBaseSid) {
+      if (Date.now() > this._newChatDeadline) this._newChatPending = false;
+      return;
+    }
+    if (this._newChatPending && !sid && this._sessionId === null) {
+      if (Date.now() > this._newChatDeadline) this._newChatPending = false;
+      return;
+    }
+    if (this._newChatPending && sid && sid !== this._newChatBaseSid) this._newChatPending = false;
+
     if (sid && sid === this._sessionId) return;
     if (sid !== this._sessionId) {
       var tracker = DCP.modules && DCP.modules.demoSearch;
@@ -332,23 +373,36 @@ var CtxRing = {
       // 防抖会被 DOM 变动不断重置，重建后圆圈迟迟不出现
       new MutationObserver(Utils.throttle(function () {
         if (!document.getElementById('dcp-ctx-ring')) {
-          self.inject();
-          // 用 _data（完整对象）重画——传 _last（数字）会走 update 的兜底分支，
-          // 把构成估算数据清零；没有数据也要画（常驻 0%）
-          self.update(self._data || self.emptyData());
+          // 官方切到新会话时会先拆掉旧工具条；此时若聊天标题/active 项也已
+          // 消失，就不能再拿旧 _data 补画，否则用户会看到上一会话 token。
+          if (!self.hasSessionDom() && self._sessionId) self.resetForNewChat();
+          else self.update(!self.hasSessionDom() ? self.emptyData() : (self._data || self.emptyData()));
           bindPrecise();
         }
         // 消息数下降通常是切会话；点击监听覆盖“两条会话消息数相同”的情况。
         self.syncSession(!self._sessionId && !!(SEL.msg && document.querySelector(SEL.msg)));
       }, 100)).observe(document.body, { childList: true, subtree: true });
+      // pointerdown 先于官方 click 处理：新建会话时在这一刻就清空，避免旧
+      // token 在 React 切换工具条的几十毫秒窗口里继续可见。
+      document.addEventListener('pointerdown', function (e) {
+        var t = e.target && e.target.closest ? e.target.closest('button[aria-label="开启新对话"]') : null;
+        if (t) self.resetForNewChat();
+      }, true);
       document.addEventListener('click', function (e) {
         var t = e.target && e.target.closest ? e.target.closest((DCP.SEL || {}).sidebarItem + ', button[aria-label="开启新对话"]') : null;
         if (t) {
+          var isNewChat = !!(t.matches && t.matches('button[aria-label="开启新对话"]'));
+          if (isNewChat) {
+            // 先同步清空，再让异步解析去辨认真正的新会话；不能等 IndexedDB。
+            self.resetForNewChat();
+          } else {
+            self._newChatPending = false;
+          }
           // 点击当前会话不应打断正在生成的数据；切到别的会话/新建会话必须在
           // 异步 currentSession 解析前立刻递增纪元，拒绝上一请求的迟到事件。
           var activeSel = (DCP.SEL || {}).sidebarItemActive;
           var sameActive = !!(activeSel && t.matches && t.matches(activeSel));
-          if (!sameActive) {
+          if (!sameActive && !isNewChat) {
             var tracker = DCP.modules && DCP.modules.demoSearch;
             if (tracker && typeof tracker.invalidateRequests === 'function') tracker.invalidateRequests();
           }
