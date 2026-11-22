@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.6
+// @version      1.0.7
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -106,7 +106,7 @@ function pageWindow() {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = window.DCP = {
-  version: '1.0.6',
+  version: '1.0.7',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -1952,6 +1952,29 @@ var DemoBridge = {
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
         var toolRoundIndex = 0;
+        // 占用公式与原来完全一致；只是在每轮工具消息追加后也发射一次，
+        // 让长任务过程中持续刷新，而不是等到整个工具循环结束才更新。
+        var emitCtxUsage = function () {
+          var uIn = (roundUsage && roundUsage.input_tokens) || 0;
+          var uCacheRead = (roundUsage && roundUsage.cache_read_input_tokens) || 0;
+          var uCacheCreate = (roundUsage && roundUsage.cache_creation_input_tokens) || 0;
+          var used = uIn + uCacheRead + uCacheCreate;
+          var estSys = Utils.estimateTokens(outbound.body.system || '');
+          var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
+          var estMsg = Utils.estimateTokens(JSON.stringify(messages));
+          var estimated = false;
+          if (!(used > 0)) {
+            var estTotal = estSys + estTool + estMsg;
+            if (estTotal > 0) { used = estTotal; estimated = true; }
+          }
+          if (used > 0) {
+            DCP.emit('ctx:api', {
+              used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
+              estSys: estSys, estTool: estTool, estMsg: estMsg, estimated: estimated,
+              model: respModel || outbound.body.model || ''
+            });
+          }
+        };
         while (true) {
           var requestBody = Object.assign({}, outbound.body, { messages: messages });
           var payload = JSON.stringify(requestBody);
@@ -2091,31 +2114,10 @@ var DemoBridge = {
             { role: 'user', content: results }
           ]);
           toolRoundIndex++;
+          emitCtxUsage();
         }
-        // 上下文占用：优先取最后一轮响应的 usage（input + cache_read + cache_creation）
-        // ——即本次请求模型实际收到的全部内容（系统/工具/历史）。端点不回 usage、
-        // 或只回 output_tokens（不少第三方/中转就这样）时，以前这里 used=0 直接不发
-        // ctx:api，圆圈永远停在 0%——用户根本分不清是「没数据」还是「真的没占用」。
-        // 改为按请求体估算兜底（与主站 estimateTokens 同一套路），面板标「估算」
-        var uIn = (roundUsage && roundUsage.input_tokens) || 0;
-        var uCacheRead = (roundUsage && roundUsage.cache_read_input_tokens) || 0;
-        var uCacheCreate = (roundUsage && roundUsage.cache_creation_input_tokens) || 0;
-        var used = uIn + uCacheRead + uCacheCreate;
-        var estSys = Utils.estimateTokens(outbound.body.system || '');
-        var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
-        var estMsg = Utils.estimateTokens(JSON.stringify(messages));
-        var estimated = false;
-        if (!(used > 0)) {
-          var estTotal = estSys + estTool + estMsg;
-          if (estTotal > 0) { used = estTotal; estimated = true; }
-        }
-        if (used > 0) {
-          DCP.emit('ctx:api', {
-            used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
-            estSys: estSys, estTool: estTool, estMsg: estMsg, estimated: estimated,
-            model: respModel || outbound.body.model || ''
-          });
-        }
+        // 最终轮再更新一次；公式与上面每轮工具消息追加后相同。
+        emitCtxUsage();
         // 收尾
         var sr = (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'refusal') ? stopReason : 'end_turn';
         var delta = { stop_reason: sr, stop_sequence: null };

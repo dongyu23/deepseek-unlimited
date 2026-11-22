@@ -655,6 +655,29 @@ var DemoBridge = {
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
         var toolRoundIndex = 0;
+        // 占用公式与原来完全一致；只是在每轮工具消息追加后也发射一次，
+        // 让长任务过程中持续刷新，而不是等到整个工具循环结束才更新。
+        var emitCtxUsage = function () {
+          var uIn = (roundUsage && roundUsage.input_tokens) || 0;
+          var uCacheRead = (roundUsage && roundUsage.cache_read_input_tokens) || 0;
+          var uCacheCreate = (roundUsage && roundUsage.cache_creation_input_tokens) || 0;
+          var used = uIn + uCacheRead + uCacheCreate;
+          var estSys = Utils.estimateTokens(outbound.body.system || '');
+          var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
+          var estMsg = Utils.estimateTokens(JSON.stringify(messages));
+          var estimated = false;
+          if (!(used > 0)) {
+            var estTotal = estSys + estTool + estMsg;
+            if (estTotal > 0) { used = estTotal; estimated = true; }
+          }
+          if (used > 0) {
+            DCP.emit('ctx:api', {
+              used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
+              estSys: estSys, estTool: estTool, estMsg: estMsg, estimated: estimated,
+              model: respModel || outbound.body.model || ''
+            });
+          }
+        };
         while (true) {
           var requestBody = Object.assign({}, outbound.body, { messages: messages });
           var payload = JSON.stringify(requestBody);
@@ -794,31 +817,10 @@ var DemoBridge = {
             { role: 'user', content: results }
           ]);
           toolRoundIndex++;
+          emitCtxUsage();
         }
-        // 上下文占用：优先取最后一轮响应的 usage（input + cache_read + cache_creation）
-        // ——即本次请求模型实际收到的全部内容（系统/工具/历史）。端点不回 usage、
-        // 或只回 output_tokens（不少第三方/中转就这样）时，以前这里 used=0 直接不发
-        // ctx:api，圆圈永远停在 0%——用户根本分不清是「没数据」还是「真的没占用」。
-        // 改为按请求体估算兜底（与主站 estimateTokens 同一套路），面板标「估算」
-        var uIn = (roundUsage && roundUsage.input_tokens) || 0;
-        var uCacheRead = (roundUsage && roundUsage.cache_read_input_tokens) || 0;
-        var uCacheCreate = (roundUsage && roundUsage.cache_creation_input_tokens) || 0;
-        var used = uIn + uCacheRead + uCacheCreate;
-        var estSys = Utils.estimateTokens(outbound.body.system || '');
-        var estTool = Utils.estimateTokens(JSON.stringify(outbound.body.tools || []));
-        var estMsg = Utils.estimateTokens(JSON.stringify(messages));
-        var estimated = false;
-        if (!(used > 0)) {
-          var estTotal = estSys + estTool + estMsg;
-          if (estTotal > 0) { used = estTotal; estimated = true; }
-        }
-        if (used > 0) {
-          DCP.emit('ctx:api', {
-            used: used, input: uIn, cacheRead: uCacheRead, cacheCreate: uCacheCreate,
-            estSys: estSys, estTool: estTool, estMsg: estMsg, estimated: estimated,
-            model: respModel || outbound.body.model || ''
-          });
-        }
+        // 最终轮再更新一次；公式与上面每轮工具消息追加后相同。
+        emitCtxUsage();
         // 收尾
         var sr = (stopReason === 'end_turn' || stopReason === 'max_tokens' || stopReason === 'refusal') ? stopReason : 'end_turn';
         var delta = { stop_reason: sr, stop_sequence: null };
