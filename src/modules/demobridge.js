@@ -253,7 +253,7 @@ var DemoBridge = {
   // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
   // 费（$0.75/1000 次，空结果不计费）。结果按 demo 解析器规范合成原生形状的
   // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
-  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId) {
+  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId, roundIndex) {
     var self = this;
     var isRead = toolName === 'read_url';
     var ti = toolInput || {};
@@ -285,6 +285,10 @@ var DemoBridge = {
     }).then(function (j) {
       var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
       var i1 = nextIdx(), i2 = nextIdx();
+      // 官方 demo 对普通 search 按整个 assistant 消息全局合并；桥接的多轮
+      // 客户端工具循环因此会显示成一张卡。首轮保持 search，后续轮次用官方
+      // 允许的 deep_search，让每轮形成独立步骤。
+      var resultKind = roundIndex > 0 ? 'deep_search' : 'search';
       var toolResultText;
       var bridgeMeta = {
         bridge_tool_name: toolName,
@@ -316,11 +320,11 @@ var DemoBridge = {
           return s;
         }).join('\n\n') || '（未搜索到结果）';
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
-          content_block: Object.assign({ type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
+          content_block: Object.assign({ type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: resultKind,
             input: { action: 'search', queries: [q] } }, bridgeMeta) }));
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
-          content_block: Object.assign({ type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
+          content_block: Object.assign({ type: 'web_search_tool_result', tool_use_id: id, kind: resultKind,
             content: results.slice(0, cnt).map(function (r) {
               return { type: 'web_search_result', title: r.title || '', url: r.url || '',
                 snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
@@ -489,9 +493,9 @@ var DemoBridge = {
     });
   },
 
-  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId) {
+  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId, roundIndex) {
     if ((DCP.config.get('demoToolMode') || 'native') === 'searchapi') {
-      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal, toolId);
+      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal, toolId, roundIndex);
     }
     var self = this;
     var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
@@ -528,8 +532,12 @@ var DemoBridge = {
           // 腿的报告文本不转发——它走 tool_result 喂回模型
           if (cb.type === 'server_tool_use' || cb.type === 'web_search_tool_result' ||
               cb.type === 'web_fetch_tool_result' || cb.type === 'thinking') {
+            var fwdCb = cb;
+            if (roundIndex > 0 && (cb.type === 'server_tool_use' || cb.type === 'web_search_tool_result')) {
+              fwdCb = Object.assign({}, cb, { kind: 'deep_search' });
+            }
             b.fwd = true;
-            push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+            push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: fwdCb }));
           }
         } else if (j.type === 'content_block_delta') {
           var d = j.delta || {};
@@ -646,6 +654,7 @@ var DemoBridge = {
         // （abort 经 signal 传到在途请求，流关闭，demo 显示“已停止”）
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
+        var toolRoundIndex = 0;
         while (true) {
           var requestBody = Object.assign({}, outbound.body, { messages: messages });
           var payload = JSON.stringify(requestBody);
@@ -759,7 +768,7 @@ var DemoBridge = {
             var tu = toolUses[ti];
             var leg;
             try {
-              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal, tu.raw.id);
+              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal, tu.raw.id, toolRoundIndex);
               addUsage(leg.usage);
             } catch (le) {
               // 腿失败 → 原生失败形状的搜索块 + 空结果喂回。id 必须配对：
@@ -767,12 +776,13 @@ var DemoBridge = {
               // 出现连续 user(tool_result)，下一次请求直接变成非法消息序列。
               var fidx = nextIdx();
               var failId = 'srvtoolu_b_' + Math.random().toString(36).slice(2, 8);
+              var failKind = toolRoundIndex > 0 ? 'deep_search' : 'search';
               push(self.sseEvent('content_block_start', { type: 'content_block_start', index: fidx,
-                content_block: { type: 'server_tool_use', id: failId, name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: 'search' } }));
+                content_block: { type: 'server_tool_use', id: failId, name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: failKind } }));
               push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: fidx }));
               var ridx = nextIdx();
               push(self.sseEvent('content_block_start', { type: 'content_block_start', index: ridx,
-                content_block: { type: 'web_search_tool_result', tool_use_id: failId, kind: 'search', content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
+                content_block: { type: 'web_search_tool_result', tool_use_id: failId, kind: failKind, content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
               push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: ridx }));
               leg = { text: '（搜索失败：' + String(le && le.message || le).slice(0, 120) + '）' };
             }
@@ -783,6 +793,7 @@ var DemoBridge = {
             { role: 'assistant', content: blocks.map(function (b) { return b.raw; }) },
             { role: 'user', content: results }
           ]);
+          toolRoundIndex++;
         }
         // 上下文占用：优先取最后一轮响应的 usage（input + cache_read + cache_creation）
         // ——即本次请求模型实际收到的全部内容（系统/工具/历史）。端点不回 usage、
