@@ -11,7 +11,7 @@ var SESS_KEY = 'dcp_sessions_v1';
 var DEFAULT_CONFIG = {
   demoCustom: false,                      // 自定义模型总开关：关=完全官方逻辑，脚本零干预
   demoEndpoint: '',                      // API 端点（空=官方 api.deepseek.com/anthropic/v1；Base URL 或完整地址都认）
-  demoKey: '',                           // API Key 覆盖（空=用页面设置里填的那把）
+  demoKey: '',                           // 第三方端点独立 Key（仅精确官方 api.deepseek.com 端点可留空）
   demoModel: '',                         // 模型名覆盖（空=官方默认 deepseek-flash）
   demoMultimodal: true,                  // 模型是否支持图片：开=转 base64 内联；关=只发文字说明
   demoCtxLimit: 128000,                   // 上下文窗口（tokens，占用环百分比用；可填 128000 / 128k / 1m）

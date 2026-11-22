@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.9
+// @version      1.0.10
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -104,23 +104,22 @@ function pageWindow() {
   return window;
 }
 
-/* ---------- 全局命名空间 + 极简事件总线 ---------- */
-var DCP = window.DCP = {
-  version: '1.0.9',
+/* ---------- 全局命名空间 + 极简事件总线 ----------
+ * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
+ * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
+var DCP = {
+  version: '1.0.10',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
   modules: {},
   _ev: {},
-  on: function (name, fn) { (this._ev[name] = this._ev[name] || []).push(fn); },
+  on: function (name, fn) { (this._ev[name] || []).push(fn); },
   emit: function (name, payload) {
     var list = this._ev[name] || [];
     for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) { console.error('[DCP]', name, e); } }
   }
 };
-// 沙箱里 window 不是页面的 window——再往页面真正的 window 上挂一份，控制台/
-// 其它脚本才拿得到 DCP（实测沙箱下不挂的话控制台里 DCP is not defined）
-try { var pw = pageWindow(); if (pw && pw !== window) pw.DCP = DCP; } catch (e) {}
 
 DCP.register = function (name, api) { this.modules[name] = api || {}; };
 
@@ -159,7 +158,7 @@ var SESS_KEY = 'dcp_sessions_v1';
 var DEFAULT_CONFIG = {
   demoCustom: false,                      // 自定义模型总开关：关=完全官方逻辑，脚本零干预
   demoEndpoint: '',                      // API 端点（空=官方 api.deepseek.com/anthropic/v1；Base URL 或完整地址都认）
-  demoKey: '',                           // API Key 覆盖（空=用页面设置里填的那把）
+  demoKey: '',                           // 第三方端点独立 Key（仅精确官方 api.deepseek.com 端点可留空）
   demoModel: '',                         // 模型名覆盖（空=官方默认 deepseek-flash）
   demoMultimodal: true,                  // 模型是否支持图片：开=转 base64 内联；关=只发文字说明
   demoCtxLimit: 128000,                   // 上下文窗口（tokens，占用环百分比用；可填 128000 / 128k / 1m）
@@ -498,6 +497,9 @@ var I18N = {
     'x-api-key（默认）或 authorization（Bearer）。StepFun 等端点的 CORS 只放行 Authorization': 'x-api-key (default) or authorization (Bearer). StepFun and similar endpoints only allow Authorization via CORS',
     'auto=端点非 deepseek 时启用（默认）；on=强制启用；off=关闭（工具随端点丢失）': 'auto = enabled when the endpoint is not deepseek (default); on = force; off = disabled (tools lost with the endpoint)',
     'API Key': 'API key',
+    '（第三方端点必填）': '(required for third-party endpoints)',
+    '第三方端点必须填写独立 Key；只有精确官方 api.deepseek.com 端点可留空并使用页面官方 Key': 'Third-party endpoints require their own key. Only the exact official api.deepseek.com endpoint may be left blank to use the page’s official key.',
+    '第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。': 'Third-party endpoints require an independent API key. The official DeepSeek key is never sent to non-official addresses.',
     '（用页面里填的官方 Key）': '(use the official key entered on the page)',
     '留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key': 'Leave empty to use the key entered in the official settings; a value here replaces the x-api-key request header',
     '模型': 'Model',
@@ -660,6 +662,17 @@ DCP.modules.toolbar = Toolbar;
 var DemoApi = {
   KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
+  // 只有精确官方域名才允许回退使用页面里的官方 Key；避免
+  // https://deepseek.com.example/... 这类地址被正则误判为官方端点。
+  isOfficialEndpoint: function (ep) {
+    var raw = String(ep || this.DEFAULT_BASE).trim();
+    try {
+      var u = new URL(raw);
+      return u.protocol === 'https:' && u.hostname.toLowerCase() === 'api.deepseek.com';
+    } catch (e) {
+      return false;
+    }
+  },
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
@@ -759,15 +772,25 @@ var DemoApi = {
         // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
         if (url.indexOf('/anthropic/v1/messages') !== -1 && DCP.config.get('demoCustom')) {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
-          // 页面原始 DeepSeek Key（供桥接的搜索腿使用，先于任何覆盖捕获）
+          var officialEndpoint = self.isOfficialEndpoint(base);
+          // 安全边界：官方 Key 只能发给精确的 api.deepseek.com。第三方端点
+          // 必须显式配置独立 Key，绝不静默回退，避免端点写错时泄露官方 Key。
+          if (!officialEndpoint && !key) {
+            return Promise.reject(new Error(DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。')));
+          }
+          // 页面原始 DeepSeek Key（仅供 api.deepseek.com 的搜索/起名腿使用）
           var origDsKey = (init && init.headers && (init.headers['x-api-key'] || init.headers['X-API-Key'] || init.headers['X-Api-Key'])) || '';
           // 1) 端点：换成完整接口地址（fullUrl 已按 base/v1/messages 三种填法归一）
           var full = self.fullUrl();
           if (full) url = full;
-          // 2) 请求头：x-api-key
+          // 2) 请求头：第三方端点只保留用户显式配置的 Key，并移除原始官方鉴权头。
           if (key && init && init.headers) {
             var h = {};
-            for (var k in init.headers) if (Object.prototype.hasOwnProperty.call(init.headers, k)) h[k] = init.headers[k];
+            for (var k in init.headers) {
+              if (!Object.prototype.hasOwnProperty.call(init.headers, k)) continue;
+              if (!officialEndpoint && /^(x-api-key|authorization)$/i.test(k)) continue;
+              h[k] = init.headers[k];
+            }
             h['x-api-key'] = key;
             init = Object.assign({}, init, { headers: h });
           }
@@ -998,9 +1021,9 @@ var DemoApi = {
     // 端点/Key 两行的说明较长，既放可见描述行（withDesc），也放输入框
     // hover 提示（title），两处共用同一字符串
     var ENDPOINT_DESC = DCP.t('填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
-    var KEY_DESC = DCP.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key');
+    var KEY_DESC = DCP.t('第三方端点必须填写独立 Key；只有精确官方 api.deepseek.com 端点可留空并使用页面官方 Key');
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
-    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
+    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（第三方端点必填）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DCP.t('deepseek-flash（官方默认）'),
       DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dcp-model-hints'));
     // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
@@ -1067,9 +1090,15 @@ var DemoApi = {
       var t0 = Date.now();
       var u = self.fullUrl() || (DemoApi.DEFAULT_BASE.replace(/\/+$/, '') + '/messages');
       var model = (DCP.config.get('demoModel') || '').trim() || 'deepseek-flash';
-      // Key：覆盖值优先；否则取页面里填的官方 Key（demo 存于 localStorage）
+      var officialEndpoint = self.isOfficialEndpoint(self.base());
+      // Key：第三方端点必须使用独立 Key；只有精确官方端点才能回退页面官方 Key。
       var key = (DCP.config.get('demoKey') || '').trim();
-      if (!key) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      if (!key && officialEndpoint) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      if (!officialEndpoint && !key) {
+        testResult.style.color = '#f87171';
+        testResult.textContent = '❌ ' + DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。');
+        return;
+      }
       // 与桥接同一套：只用 Authorization: Bearer（详见 demobridge.keyHeader 注释）
       var headers = { 'Content-Type': 'application/json' };
       if (key) headers['Authorization'] = 'Bearer ' + key;
@@ -1363,7 +1392,8 @@ var DemoBridge = {
     if (!DCP.config.get('demoCustom')) return false;   // 总开关关闭 = 完全官方逻辑
     var ep = (DCP.config.get('demoEndpoint') || '').trim();
     if (!ep) return false;
-    if (/deepseek\.com/i.test(ep)) return false;    // 官方端点 → 原生透传（工具原生工作）
+    var api = DCP.modules.demoApi;
+    if (api && typeof api.isOfficialEndpoint === 'function' && api.isOfficialEndpoint(ep)) return false;
     var mode = DCP.config.get('demoBridge') || 'auto';
     return mode !== 'off';
   },
@@ -1383,12 +1413,9 @@ var DemoBridge = {
   // Key 一律放 Authorization: Bearer：DeepSeek 文档原话「x-api-key 或
   // Authorization 任一种」、Anthropic 官方两个都收，而 Authorization 几乎在每个
   // 站点的 CORS allow-headers 里，x-api-key 经常不在（StepFun 就是）
-  keyHeader: function (headers) {
+  keyHeader: function () {
+    // 第三方端点只接受用户显式配置的 Key；官方 Key 仅用于 DeepSeek 官方腿。
     var key = (DCP.config.get('demoKey') || '').trim();
-    if (!key) {
-      // 没覆盖 Key：取页面原始请求里那个，但同样换成 Authorization
-      key = (headers && (headers['x-api-key'] || headers['X-API-Key'] || headers['X-Api-Key'])) || '';
-    }
     var h = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
     if (key) h['Authorization'] = 'Bearer ' + key;
     return h;
@@ -2212,7 +2239,7 @@ var CtxRing = {
   },
 
   inject: function () {
-    var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
+    var bar = (DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
     if (!bar || document.getElementById('dcp-ctx-ring')) return;
     var C = 2 * Math.PI * this.R;
     var btn = document.createElement('button');
@@ -2519,7 +2546,7 @@ DCP.modules.ctxRing = CtxRing;
  * ============================================================ */
 var TpsMeter = {
   inject: function () {
-    var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
+    var bar = (DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
     if (!bar || document.getElementById('dcp-tps-meter')) return;
     var el = document.createElement('div');
     el.id = 'dcp-tps-meter';

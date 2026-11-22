@@ -54,7 +54,8 @@ var DemoBridge = {
     if (!DCP.config.get('demoCustom')) return false;   // 总开关关闭 = 完全官方逻辑
     var ep = (DCP.config.get('demoEndpoint') || '').trim();
     if (!ep) return false;
-    if (/deepseek\.com/i.test(ep)) return false;    // 官方端点 → 原生透传（工具原生工作）
+    var api = DCP.modules.demoApi;
+    if (api && typeof api.isOfficialEndpoint === 'function' && api.isOfficialEndpoint(ep)) return false;
     var mode = DCP.config.get('demoBridge') || 'auto';
     return mode !== 'off';
   },
@@ -74,12 +75,9 @@ var DemoBridge = {
   // Key 一律放 Authorization: Bearer：DeepSeek 文档原话「x-api-key 或
   // Authorization 任一种」、Anthropic 官方两个都收，而 Authorization 几乎在每个
   // 站点的 CORS allow-headers 里，x-api-key 经常不在（StepFun 就是）
-  keyHeader: function (headers) {
+  keyHeader: function () {
+    // 第三方端点只接受用户显式配置的 Key；官方 Key 仅用于 DeepSeek 官方腿。
     var key = (DCP.config.get('demoKey') || '').trim();
-    if (!key) {
-      // 没覆盖 Key：取页面原始请求里那个，但同样换成 Authorization
-      key = (headers && (headers['x-api-key'] || headers['X-API-Key'] || headers['X-Api-Key'])) || '';
-    }
     var h = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
     if (key) h['Authorization'] = 'Bearer ' + key;
     return h;

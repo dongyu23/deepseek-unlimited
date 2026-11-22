@@ -29,6 +29,17 @@
 var DemoApi = {
   KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
+  // 只有精确官方域名才允许回退使用页面里的官方 Key；避免
+  // https://deepseek.com.example/... 这类地址被正则误判为官方端点。
+  isOfficialEndpoint: function (ep) {
+    var raw = String(ep || this.DEFAULT_BASE).trim();
+    try {
+      var u = new URL(raw);
+      return u.protocol === 'https:' && u.hostname.toLowerCase() === 'api.deepseek.com';
+    } catch (e) {
+      return false;
+    }
+  },
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
@@ -128,15 +139,25 @@ var DemoApi = {
         // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
         if (url.indexOf('/anthropic/v1/messages') !== -1 && DCP.config.get('demoCustom')) {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
-          // 页面原始 DeepSeek Key（供桥接的搜索腿使用，先于任何覆盖捕获）
+          var officialEndpoint = self.isOfficialEndpoint(base);
+          // 安全边界：官方 Key 只能发给精确的 api.deepseek.com。第三方端点
+          // 必须显式配置独立 Key，绝不静默回退，避免端点写错时泄露官方 Key。
+          if (!officialEndpoint && !key) {
+            return Promise.reject(new Error(DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。')));
+          }
+          // 页面原始 DeepSeek Key（仅供 api.deepseek.com 的搜索/起名腿使用）
           var origDsKey = (init && init.headers && (init.headers['x-api-key'] || init.headers['X-API-Key'] || init.headers['X-Api-Key'])) || '';
           // 1) 端点：换成完整接口地址（fullUrl 已按 base/v1/messages 三种填法归一）
           var full = self.fullUrl();
           if (full) url = full;
-          // 2) 请求头：x-api-key
+          // 2) 请求头：第三方端点只保留用户显式配置的 Key，并移除原始官方鉴权头。
           if (key && init && init.headers) {
             var h = {};
-            for (var k in init.headers) if (Object.prototype.hasOwnProperty.call(init.headers, k)) h[k] = init.headers[k];
+            for (var k in init.headers) {
+              if (!Object.prototype.hasOwnProperty.call(init.headers, k)) continue;
+              if (!officialEndpoint && /^(x-api-key|authorization)$/i.test(k)) continue;
+              h[k] = init.headers[k];
+            }
             h['x-api-key'] = key;
             init = Object.assign({}, init, { headers: h });
           }
@@ -367,9 +388,9 @@ var DemoApi = {
     // 端点/Key 两行的说明较长，既放可见描述行（withDesc），也放输入框
     // hover 提示（title），两处共用同一字符串
     var ENDPOINT_DESC = DCP.t('填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
-    var KEY_DESC = DCP.t('留空 = 用官方设置里填的 Key；填写则替换请求头 x-api-key');
+    var KEY_DESC = DCP.t('第三方端点必须填写独立 Key；只有精确官方 api.deepseek.com 端点可留空并使用页面官方 Key');
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
-    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（用页面里填的官方 Key）'), KEY_DESC, true), KEY_DESC));
+    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（第三方端点必填）'), KEY_DESC, true), KEY_DESC));
     cfgBox.appendChild(mkRow('模型', 'model', DCP.t('deepseek-flash（官方默认）'),
       DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dcp-model-hints'));
     // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
@@ -436,9 +457,15 @@ var DemoApi = {
       var t0 = Date.now();
       var u = self.fullUrl() || (DemoApi.DEFAULT_BASE.replace(/\/+$/, '') + '/messages');
       var model = (DCP.config.get('demoModel') || '').trim() || 'deepseek-flash';
-      // Key：覆盖值优先；否则取页面里填的官方 Key（demo 存于 localStorage）
+      var officialEndpoint = self.isOfficialEndpoint(self.base());
+      // Key：第三方端点必须使用独立 Key；只有精确官方端点才能回退页面官方 Key。
       var key = (DCP.config.get('demoKey') || '').trim();
-      if (!key) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      if (!key && officialEndpoint) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
+      if (!officialEndpoint && !key) {
+        testResult.style.color = '#f87171';
+        testResult.textContent = '❌ ' + DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。');
+        return;
+      }
       // 与桥接同一套：只用 Authorization: Bearer（详见 demobridge.keyHeader 注释）
       var headers = { 'Content-Type': 'application/json' };
       if (key) headers['Authorization'] = 'Bearer ' + key;

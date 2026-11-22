@@ -7,7 +7,7 @@
  * ============================================================ */
 var TpsMeter = {
   inject: function () {
-    var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
+    var bar = (DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
     if (!bar || document.getElementById('dcp-tps-meter')) return;
     var el = document.createElement('div');
     el.id = 'dcp-tps-meter';

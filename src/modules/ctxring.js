@@ -40,7 +40,7 @@ var CtxRing = {
   },
 
   inject: function () {
-    var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
+    var bar = (DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
     if (!bar || document.getElementById('dcp-ctx-ring')) return;
     var C = 2 * Math.PI * this.R;
     var btn = document.createElement('button');

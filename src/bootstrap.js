@@ -83,23 +83,22 @@ function pageWindow() {
   return window;
 }
 
-/* ---------- 全局命名空间 + 极简事件总线 ---------- */
-var DCP = window.DCP = {
+/* ---------- 全局命名空间 + 极简事件总线 ----------
+ * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
+ * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
+var DCP = {
   version: '8.5.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
   modules: {},
   _ev: {},
-  on: function (name, fn) { (this._ev[name] = this._ev[name] || []).push(fn); },
+  on: function (name, fn) { (this._ev[name] || []).push(fn); },
   emit: function (name, payload) {
     var list = this._ev[name] || [];
     for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) { console.error('[DCP]', name, e); } }
   }
 };
-// 沙箱里 window 不是页面的 window——再往页面真正的 window 上挂一份，控制台/
-// 其它脚本才拿得到 DCP（实测沙箱下不挂的话控制台里 DCP is not defined）
-try { var pw = pageWindow(); if (pw && pw !== window) pw.DCP = DCP; } catch (e) {}
 
 DCP.register = function (name, api) { this.modules[name] = api || {}; };
 
