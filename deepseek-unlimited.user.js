@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.13
+// @version      1.0.14
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -108,7 +108,7 @@ function pageWindow() {
  * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
  * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
 var DCP = {
-  version: '1.0.13',
+  version: '1.0.14',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -1491,7 +1491,7 @@ var DemoBridge = {
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
       '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
-      'web_search 的 query、count、need_content、ori_question 及搜索语法均由你按当前任务自行决定。';
+      'web_search 的参数没有固定搭配，请按当前任务自主选择、灵活组合。';
     var searchLimit = String(DCP.config.get('demoSearchLimit') || 'unlimited');
     if (searchLimit === '1' || searchLimit === '2') {
       system += '同一轮回答中 web_search 不超过 ' + searchLimit + ' 次，尽量一次搜准。';
@@ -1506,14 +1506,11 @@ var DemoBridge = {
       // 时间，也没法多要结果，等于白放一半能力
       { name: 'web_search',
         description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。' +
-          '本工具的 query、count、need_content、ori_question 及搜索语法均由你按任务自行决定。' +
-          'query 支持搜索语法（可组合）：site:example.com 限定站点；多个站点用 site:a.com OR site:b.com；' +
-          '-site:x.com 排除站点；-关键词 排除；"精确短语" 精确匹配；lang:zh-CN 限定语言；' +
-          'after:2026-01-01 / before:2026-06-01 限定发布时间。查近期事件时优先用 after: 收窄。',
+          'query 支持站点限定、排除、精确匹配、语言与时间范围等搜索语法，可按任务需要自主组合。',
         input_schema: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: '搜索词，1~128 个字符，支持 site: / -site: / -排除词 / "精确短语" / lang: / after: / before: 语法' },
+            query: { type: 'string', description: '搜索词，1~128 个字符，可按任务需要组合使用支持的搜索语法' },
             count: { type: 'integer', description: '返回条数，1~50。条数不影响费用，可按需选择' },
             need_content: { type: 'boolean', description: '是否在结果中返回网页正文，默认 false。需要引用原文细节时设 true' },
             ori_question: { type: 'string', description: '触发本次搜索的用户原始问题，1~128 字符，能帮助搜索服务理解意图' }
