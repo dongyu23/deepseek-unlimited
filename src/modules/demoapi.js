@@ -27,7 +27,7 @@
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -511,6 +511,10 @@ var DemoApi = {
     advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
       DCP.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
       DCP.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比')));
+    advBox.appendChild(mkSwitch('显示上下文占用环', 'showCtxRing',
+      DCP.t('在输入工具条发送按钮一侧显示上下文占用环；关闭后仍会继续统计，只是不显示')));
+    advBox.appendChild(mkSwitch('显示实时 TPS', 'showTps',
+      DCP.t('在上下文占用环左侧显示实时输出速率（thinking + 正文 token/秒）；仅自定义模型桥接工作时生效')));
     advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
       [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
       'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));

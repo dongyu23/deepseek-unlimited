@@ -78,6 +78,7 @@ var CtxRing = {
   // 是 0」比不显示更糟，故与设置面板同一思路：不适用就隐藏
   canShow: function () {
     if (!DCP.config.get('demoCustom')) return false;
+    if (!DCP.config.get('demoShowCtxRing')) return false;
     var B = DCP.modules.demoBridge;
     return !!(B && typeof B.active === 'function' && B.active());
   },
@@ -274,7 +275,7 @@ var CtxRing = {
       // demoCustom 开着但端点是官方/未配时桥接不跑，圆圈永远拿不到数据，
       // 那种情况下隐藏（见 canShow 注释）
       DCP.on('cfg:change', function (e) {
-        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge') {
+        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowCtxRing') {
           self.update(self._data || self.emptyData());
           if (!self.canShow()) self.hidePanel();
         }

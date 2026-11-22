@@ -14,6 +14,7 @@ const ORDER = [
   'modules/demoapi.js',
   'modules/demobridge.js',
   'modules/ctxring.js',
+  'modules/tpsmeter.js',
   'modules/demosearch.js',
   'modules/demopastetxt.js',
   'modules/tabtitle.js',

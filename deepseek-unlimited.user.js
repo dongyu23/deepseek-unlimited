@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.0
+// @version      1.0.4
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -106,7 +106,7 @@ function pageWindow() {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = window.DCP = {
-  version: '1.0.0',
+  version: '1.0.4',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -163,6 +163,8 @@ var DEFAULT_CONFIG = {
   demoModel: '',                         // 模型名覆盖（空=官方默认 deepseek-flash）
   demoMultimodal: true,                  // 模型是否支持图片：开=转 base64 内联；关=只发文字说明
   demoCtxLimit: 128000,                   // 上下文窗口（tokens，占用环百分比用；可填 128000 / 128k / 1m）
+  demoShowCtxRing: true,                  // 是否在工具条显示上下文占用环
+  demoShowTps: false,                     // 是否在工具条显示实时输出速率
   demoToolMode: 'native',                // 工具调用方式：native=DeepSeek 模型驱动搜索（含模型 token 费）/ searchapi=直调搜索 API（仅付搜索费）
   demoBridge: 'auto',                    // 工具桥接：auto(端点非 deepseek 即启用) / on / off
   demoTitleSource: 'deepseek'            // 会话标题来源：deepseek=官方端点起名腿 / model=自定义模型起名 / off=首条消息截断
@@ -460,6 +462,18 @@ var I18N = {
     '总量与缓存命中率为接口 usage 精确值；构成占比按请求结构估算': 'Total and cache hit rate are exact values from the API usage; the composition split is estimated from the request structure',
     '上下文占用': 'Context usage',
     '上下文窗口': 'Context window',
+    '显示上下文占用环': 'Show context usage ring',
+    '在输入工具条发送按钮一侧显示上下文占用环；关闭后仍会继续统计，只是不显示': 'Show the context usage ring beside the send button. When off, usage is still counted but hidden.',
+    '显示实时 TPS': 'Show live TPS',
+    '在上下文占用环左侧显示实时输出速率（thinking + 正文 token/秒）；仅自定义模型桥接工作时生效': 'Show live output rate (thinking + text tokens per second) to the left of the context ring. Only active while the custom-model bridge is running.',
+    '-- tok/s': '-- tok/s',
+    '实时 -- tok/s': 'Live -- tok/s',
+    '实时 {n} tok/s': 'Live {n} tok/s',
+    '平均 {n} tok/s': 'Avg {n} tok/s',
+    '{n} tok/s': '{n} tok/s',
+    '本轮已输出 {tokens} tokens，用时 {sec} 秒（{kind}）': '{tokens} output tokens in {sec}s ({kind})',
+    '实时估算': 'live estimate',
+    '接口 usage 精确值': 'exact API usage',
     '所用模型的上下文窗口（tokens）。输入框旁的圆圈按 占用/窗口 显示百分比': 'The context window of the model in use (tokens). The ring beside the input box shows usage / window as a percentage',
     '来自模型接口返回的 usage 精确值（系统提示 + 工具 + 完整历史）': 'Exact value from the usage field returned by the model API (system prompt + tools + full history)',
     '测试连接与模型身份': 'Test connection & model identity',
@@ -637,7 +651,7 @@ DCP.modules.toolbar = Toolbar;
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -1121,6 +1135,10 @@ var DemoApi = {
     advBox.appendChild(withDesc(mkRow('上下文窗口', 'ctxLimit', '128000',
       DCP.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比'), false, null, null),
       DCP.t('所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比')));
+    advBox.appendChild(mkSwitch('显示上下文占用环', 'showCtxRing',
+      DCP.t('在输入工具条发送按钮一侧显示上下文占用环；关闭后仍会继续统计，只是不显示')));
+    advBox.appendChild(mkSwitch('显示实时 TPS', 'showTps',
+      DCP.t('在上下文占用环左侧显示实时输出速率（thinking + 正文 token/秒）；仅自定义模型桥接工作时生效')));
     advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
       [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
       'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));
@@ -1468,6 +1486,12 @@ var DemoBridge = {
       messages: messages,
       tools: tools
     };
+    // 官方 demo 的思考开关是请求字段，不是 UI 状态。桥接此前把它当私有字段
+    // 剥掉，第三方模型因此可能不先思考，直接输出文本再调工具，块顺序与官方
+    // 不一致。思考开启时原样透传，保证与官方同一协议语义。
+    if (body.thinking === true || (body.thinking && body.thinking.type === 'enabled')) {
+      out.thinking = { type: 'enabled' };
+    }
     return { url: this.normUrl((DCP.config.get('demoEndpoint') || '').trim()), headers: this.keyHeader(origHeaders), body: out };
   },
 
@@ -1526,7 +1550,7 @@ var DemoBridge = {
   // 同一把 DeepSeek Key），不发起模型对话——没有模型 token 费，只按次计搜索
   // 费（$0.75/1000 次，空结果不计费）。结果按 demo 解析器规范合成原生形状的
   // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
-  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+  runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId) {
     var self = this;
     var isRead = toolName === 'read_url';
     var ti = toolInput || {};
@@ -1559,40 +1583,47 @@ var DemoBridge = {
       var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
       var i1 = nextIdx(), i2 = nextIdx();
       var toolResultText;
+      var bridgeMeta = {
+        bridge_tool_name: toolName,
+        bridge_tool_input: toolInput,
+        bridge_tool_id: toolId
+      };
       if (isRead) {
         // 读网页：open_page 动作块 + web_fetch_tool_result（content 为单对象）
         var title = (j && j.title) || q;
         var content = (j && j.content) || '';
+        toolResultText = (title ? title + '\n' : '') + String(content);
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
-          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_read_url', kind: 'read_link',
-            input: { action: 'open_page', url: q } } }));
+          content_block: Object.assign({ type: 'server_tool_use', id: id, name: 'deepseek_read_url', kind: 'read_link',
+            input: { action: 'open_page', url: q } }, bridgeMeta) }));
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
         push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
-          content_block: { type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
-            content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } } }));
+          content_block: Object.assign({ type: 'web_fetch_tool_result', tool_use_id: id, kind: 'read_link',
+            content: { type: 'web_fetch_result', url: q, content: { title: title }, published_at: '' } },
+            { bridge_tool_result: toolResultText }) }));
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
-        toolResultText = (title ? title + '\n' : '') + String(content);
       } else {
         var results = (j && j.results) || [];
-        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
-          content_block: { type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
-            input: { action: 'search', queries: [q] } } }));
-        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
-        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
-          content_block: { type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
-            content: results.slice(0, cnt).map(function (r) {
-              return { type: 'web_search_result', title: r.title || '', url: r.url || '',
-                snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
-                site_icon: r.site_icon || '', page_age: r.date || '' };
-            }) } }));
-        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
         // 喂回模型的文本：默认只给标题/URL/摘要（snippet 给人看、summary 给模型读），
-        // 模型显式要正文（need_content）时把 content 也带上
+        // 模型显式要正文（need_content）时把 content 也带上。先算文本，再原样
+        // 附到官方结果块里，下次中断恢复无需再猜或截断。
         toolResultText = results.slice(0, cnt).map(function (r, i) {
           var s = (i + 1) + '. ' + (r.title || '') + '\n' + (r.url || '') + '\n' + (r.snippet || r.summary || '');
           if (wantContent && r.content) s += '\n' + String(r.content);
           return s;
         }).join('\n\n') || '（未搜索到结果）';
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i1,
+          content_block: Object.assign({ type: 'server_tool_use', id: id, name: 'deepseek_web_search', kind: 'search',
+            input: { action: 'search', queries: [q] } }, bridgeMeta) }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i1 }));
+        push(self.sseEvent('content_block_start', { type: 'content_block_start', index: i2,
+          content_block: Object.assign({ type: 'web_search_tool_result', tool_use_id: id, kind: 'search',
+            content: results.slice(0, cnt).map(function (r) {
+              return { type: 'web_search_result', title: r.title || '', url: r.url || '',
+                snippet: r.snippet || r.summary || '', site_name: r.site_name || '',
+                site_icon: r.site_icon || '', page_age: r.date || '' };
+            }) }, { bridge_tool_result: toolResultText }) }));
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
       }
       return { text: toolResultText };
     }).catch(function (e) {
@@ -1755,9 +1786,9 @@ var DemoBridge = {
     });
   },
 
-  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal) {
+  runLeg: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId) {
     if ((DCP.config.get('demoToolMode') || 'native') === 'searchapi') {
-      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal);
+      return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal, toolId);
     }
     var self = this;
     var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
@@ -1818,11 +1849,32 @@ var DemoBridge = {
   },
 
   /* ---------- 主流程 ---------- */
-  intercept: function (url, init, dsKey) {
+  intercept: async function (url, init, dsKey) {
     var self = this;
     var body = null;
     try { body = JSON.parse(init.body); } catch (e) { return null; }
     if (!body || !body.messages) return null;
+
+    // 官方 demo 会把工具块从下一次 API 请求里过滤掉，但它自己的 IndexedDB
+    // 仍完整保存着这些块。发起第三方请求前，从官方会话记录无损恢复中断轮，
+    // 不另建存储、不截断内容。
+    try {
+      var search = DCP.modules && DCP.modules.demoSearch;
+      var recovered = search && await search.recoverBridgeRequest(body.messages);
+      if (recovered && recovered.messages) {
+        body = Object.assign({}, body, { messages: recovered.messages });
+        console.log('[DCP] recovered interrupted bridge history', {
+          sessionId: recovered.sessionId,
+          targetId: recovered.targetId,
+          status: recovered.status,
+          mode: recovered.mode,
+          recoveredMessages: recovered.recoveredMessages,
+          recoveredBlocks: recovered.recoveredBlocks
+        });
+      }
+    } catch (e) {
+      console.warn('[DCP] recover bridge history failed', e);
+    }
 
     var outbound = this.buildOutbound(body, init.headers || {});
     // 会话首条用户消息：搜索腿的 ori_question 兜底（官方文档说带上原始问题能改善
@@ -1884,6 +1936,7 @@ var DemoBridge = {
           message: { id: 'msg_bridge_' + Math.random().toString(36).slice(2, 10), type: 'message', role: 'assistant',
             model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
         }));
+        DCP.emit('tps:start');
         // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
         // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
         // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
@@ -1891,20 +1944,52 @@ var DemoBridge = {
         var messages = outbound.body.messages.slice();
         var stopReason = 'end_turn';
         while (true) {
+          var requestBody = Object.assign({}, outbound.body, { messages: messages });
+          var payload = JSON.stringify(requestBody);
           var resp = await self.nativeFetch()(outbound.url, {
             method: 'POST', signal: ac.signal,
             headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
-            body: JSON.stringify(Object.assign({}, outbound.body, { messages: messages }))
+            body: payload
           });
           if (!resp.ok) {
             var et = await resp.text().catch(function () { return ''; });
             var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
+            console.warn('[DCP] endpoint rejected request', {
+              status: resp.status,
+              messageCount: messages.length,
+              payloadBytes: payload.length,
+              roles: messages.map(function (m) { return m && m.role; }),
+              blockTypes: messages.reduce(function (acc, m) {
+                (Array.isArray(m && m.content) ? m.content : []).forEach(function (b) { if (b && b.type) acc[b.type] = (acc[b.type] || 0) + 1; });
+                return acc;
+              }, {})
+            });
             push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
+            DCP.emit('tps:idle');
             finish(); return;
           }
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
           var roundUsage = null, roundStop = 'end_turn', respModel = '';
+          var tpsStart = 0, tpsLiveTokens = 0, tpsLastEmit = 0, tpsTimer = null;
+          var emitTps = function (authoritative) {
+            if (!tpsStart) return;
+            var elapsed = (performance.now() - tpsStart) / 1000;
+            if (!(elapsed > 0)) return;
+            var tokens = authoritative && roundUsage && roundUsage.output_tokens > 0
+              ? roundUsage.output_tokens : tpsLiveTokens;
+            if (!(tokens > 0)) return;
+            var now = performance.now();
+            if (!authoritative && now - tpsLastEmit < 200) return;
+            tpsLastEmit = now;
+            DCP.emit('tps:update', {
+              tps: tokens / elapsed,
+              tokens: tokens,
+              elapsed: elapsed,
+              estimated: !authoritative
+            });
+          };
+          tpsTimer = setInterval(function () { emitTps(false); }, 250);
           // usage 合并：Anthropic 系把 input 类放在 message_start.message.usage、
           // output 放在 message_delta.usage，很多第三方端点只给其中一个——
           // 以前只读 message_delta，遇到「只在 message_start 给 input_tokens」
@@ -1916,38 +2001,52 @@ var DemoBridge = {
               if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
             });
           };
-          await self.pump(resp.body, function (j) {
-            if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
-            if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
-            if (j.type === 'content_block_start') {
-              var cb = j.content_block || {};
-              var b = { type: cb.type, raw: cb, index: nextIdx() };
-              blocks.push(b); partial[b.index] = '';
-              if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
-                push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
-              }
-            } else if (j.type === 'content_block_delta') {
-              var d = j.delta || {};
-              var blk = blocks[blocks.length - 1];
-              if (!blk) return;
-              if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
-              if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
-                if (blk.type === 'tool_use') return;
-                push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
-              }
-            } else if (j.type === 'content_block_stop') {
-              var b2 = blocks[blocks.length - 1];
-              if (b2) {
-                if (b2.type === 'tool_use') {
-                  try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+          await (async function () {
+            try {
+              await self.pump(resp.body, function (j) {
+                if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+                if (j.type === 'message_start') {
+                  tpsStart = performance.now();
+                  tpsLiveTokens = 0;
+                  tpsLastEmit = 0;
                 }
-                push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
-              }
-            } else if (j.type === 'message_delta') {
-              mergeUsage(j.usage);
-              if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+                if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
+                if (j.type === 'content_block_start') {
+                  var cb = j.content_block || {};
+                  var b = { type: cb.type, raw: cb, index: nextIdx() };
+                  blocks.push(b); partial[b.index] = '';
+                  if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                    push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+                  }
+                } else if (j.type === 'content_block_delta') {
+                  var d = j.delta || {};
+                  var blk = blocks[blocks.length - 1];
+                  if (!blk) return;
+                  if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
+                  if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
+                    if (blk.type === 'tool_use') return;
+                    if (d.type === 'text_delta') tpsLiveTokens += Utils.estimateTokens(d.text || '');
+                    else if (d.type === 'thinking_delta') tpsLiveTokens += Utils.estimateTokens(d.thinking || '');
+                    push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+                  }
+                } else if (j.type === 'content_block_stop') {
+                  var b2 = blocks[blocks.length - 1];
+                  if (b2) {
+                    if (b2.type === 'tool_use') {
+                      try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+                    }
+                    push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+                  }
+                } else if (j.type === 'message_delta') {
+                  mergeUsage(j.usage);
+                  if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+                  if (blocks.some(function (b) { return b.type === 'thinking' || b.type === 'text'; })) emitTps(true);
+                }
+              }, ac.signal);
+            } finally {
+              if (tpsTimer) { clearInterval(tpsTimer); tpsTimer = null; }
             }
-          }, ac.signal);
+          })();
           addUsage(roundUsage);
           var toolUses = blocks.filter(function (b) { return b.type === 'tool_use'; });
           if (roundStop !== 'tool_use' || !toolUses.length) { stopReason = roundStop; break; }
@@ -1957,17 +2056,20 @@ var DemoBridge = {
             var tu = toolUses[ti];
             var leg;
             try {
-              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal);
+              leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal, tu.raw.id);
               addUsage(leg.usage);
             } catch (le) {
-              // 腿失败 → 原生失败形状的搜索块 + 空结果喂回
+              // 腿失败 → 原生失败形状的搜索块 + 空结果喂回。id 必须配对：
+              // 旧版结果固定用 srvtoolu_b_x，而调用块是随机 id，官方会话会
+              // 出现连续 user(tool_result)，下一次请求直接变成非法消息序列。
               var fidx = nextIdx();
+              var failId = 'srvtoolu_b_' + Math.random().toString(36).slice(2, 8);
               push(self.sseEvent('content_block_start', { type: 'content_block_start', index: fidx,
-                content_block: { type: 'server_tool_use', id: 'srvtoolu_b_' + Math.random().toString(36).slice(2, 8), name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: 'search' } }));
+                content_block: { type: 'server_tool_use', id: failId, name: 'deepseek_web_search', input: { action: 'search', queries: [String((tu.raw.input || {}).query || '').slice(0, 80)] }, kind: 'search' } }));
               push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: fidx }));
               var ridx = nextIdx();
               push(self.sseEvent('content_block_start', { type: 'content_block_start', index: ridx,
-                content_block: { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_b_x', kind: 'search', content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
+                content_block: { type: 'web_search_tool_result', tool_use_id: failId, kind: 'search', content: [{ type: 'web_search_tool_result_error', error_code: 'search_unavailable' }] } }));
               push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: ridx }));
               leg = { text: '（搜索失败：' + String(le && le.message || le).slice(0, 120) + '）' };
             }
@@ -2022,7 +2124,9 @@ var DemoBridge = {
         }
         push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
         push(self.sseEvent('message_stop', { type: 'message_stop' }));
+        DCP.emit('tps:idle');
       } catch (e) {
+        DCP.emit('tps:idle');
         if (e && e.name === 'AbortError') { finish(); return; }
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
@@ -2115,6 +2219,7 @@ var CtxRing = {
   // 是 0」比不显示更糟，故与设置面板同一思路：不适用就隐藏
   canShow: function () {
     if (!DCP.config.get('demoCustom')) return false;
+    if (!DCP.config.get('demoShowCtxRing')) return false;
     var B = DCP.modules.demoBridge;
     return !!(B && typeof B.active === 'function' && B.active());
   },
@@ -2311,7 +2416,7 @@ var CtxRing = {
       // demoCustom 开着但端点是官方/未配时桥接不跑，圆圈永远拿不到数据，
       // 那种情况下隐藏（见 canShow 注释）
       DCP.on('cfg:change', function (e) {
-        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge') {
+        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowCtxRing') {
           self.update(self._data || self.emptyData());
           if (!self.canShow()) self.hidePanel();
         }
@@ -2342,6 +2447,119 @@ var CtxRing = {
   }
 };
 DCP.modules.ctxRing = CtxRing;
+
+/* ===== modules/tpsmeter.js ===== */
+/* ============================================================
+ * modules/tpsmeter：自定义模型实时输出速率（thinking + 正文）
+ *
+ * demobridge 每轮请求按 message_start → message_delta 计算平均
+ * token/秒，并通过 tps:start / tps:update / tps:idle 广播。本模块只在
+ * 输入工具条上下文环左侧显示纯文本速率；默认关闭，可在高级选项开启。
+ * ============================================================ */
+var TpsMeter = {
+  inject: function () {
+    var bar = (window.DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
+    if (!bar || document.getElementById('dcp-tps-meter')) return;
+    var el = document.createElement('div');
+    el.id = 'dcp-tps-meter';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    el.style.cssText = 'display:none;align-items:center;justify-content:flex-end;height:24px;' +
+      'box-sizing:border-box;padding:0 4px;background:transparent;color:inherit;font-size:11px;line-height:1;' +
+      'font-variant-numeric:tabular-nums;white-space:nowrap;flex:0 0 auto;margin:0 4px 0 0;opacity:.72';
+    el.textContent = DCP.t('-- tok/s');
+
+    var ring = document.getElementById('dcp-ctx-ring');
+    if (ring && ring.parentElement === bar) {
+      bar.insertBefore(el, ring);
+    } else {
+      var sendBtn = bar.querySelector('[class*="sendButton"]');
+      var ref = sendBtn;
+      while (ref && ref.parentElement && ref.parentElement !== bar) ref = ref.parentElement;
+      if (ref && ref.parentElement === bar) bar.insertBefore(el, ref);
+      else bar.appendChild(el);
+    }
+    return el;
+  },
+
+  canShow: function () {
+    if (!DCP.config.get('demoCustom')) return false;
+    if (!DCP.config.get('demoShowTps')) return false;
+    var B = DCP.modules.demoBridge;
+    return !!(B && typeof B.active === 'function' && B.active());
+  },
+
+  fmt: function (n) {
+    n = Number(n) || 0;
+    if (n >= 100) return n.toFixed(0);
+    if (n >= 10) return n.toFixed(1);
+    return n.toFixed(2);
+  },
+
+  render: function () {
+    var el = document.getElementById('dcp-tps-meter') || this.inject();
+    if (!el) return;
+    if (this._active) {
+      el.textContent = this._last
+        ? DCP.t('实时 {n} tok/s', { n: this.fmt(this._last.tps) })
+        : DCP.t('实时 -- tok/s');
+    } else {
+      el.textContent = this._last
+        ? DCP.t('平均 {n} tok/s', { n: this.fmt(this._last.tps) })
+        : DCP.t('-- tok/s');
+    }
+    if (this._last) {
+      el.title = DCP.t('本轮已输出 {tokens} tokens，用时 {sec} 秒（{kind}）', {
+        tokens: Math.round(this._last.tokens || 0),
+        sec: (Number(this._last.elapsed) || 0).toFixed(2),
+        kind: this._last.estimated ? DCP.t('实时估算') : DCP.t('接口 usage 精确值')
+      });
+    } else {
+      el.title = '';
+    }
+    el.style.display = this.canShow() ? 'inline-flex' : 'none';
+  },
+
+  start: function () {
+    this._active = true;
+    this.render();
+  },
+
+  paint: function (data) {
+    if (data && data.tps > 0) this._last = data;
+    this._active = true;
+    this.render();
+  },
+
+  idle: function () {
+    this._active = false;
+    this.render();
+  },
+
+  init: function () {
+    var self = this;
+    Utils.onReady(function () {
+      self.inject();
+      self.render();
+      DCP.on('tps:start', function () { self.start(); });
+      DCP.on('tps:update', function (p) { self.paint(p); });
+      DCP.on('tps:idle', function () { self.idle(); });
+      DCP.on('cfg:change', function (e) {
+        if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowTps') {
+          self.render();
+        }
+      });
+      // 工具条会随会话切换重建；与上下文环相同，掉了就补回来。
+      new MutationObserver(Utils.throttle(function () {
+        if (!document.getElementById('dcp-tps-meter')) {
+          self.inject();
+          self.render();
+        }
+      }, 100)).observe(document.body, { childList: true, subtree: true });
+    });
+  }
+};
+DCP.modules.tpsMeter = TpsMeter;
 
 /* ===== modules/demosearch.js ===== */
 /* ============================================================
@@ -2701,6 +2919,278 @@ var DemoSearch = {
     var el = items[idx];
     if (!el) return;
     Utils.realClick(el);
+  },
+
+  /* ---------- 桥接中断轮恢复 ----------
+   * demo 的 IndexedDB 已完整保存 server_tool_use / tool_result / thinking，
+   * 但官方下一次请求只带文本块。这里从同一份官方记录重建结构化 API 历史，
+   * 不另建存储、不截断内容。 */
+  requestText: function (m) {
+    if (!m) return '';
+    if (typeof m.content === 'string') return m.content;
+    if (!Array.isArray(m.content)) return '';
+    var parts = [];
+    m.content.forEach(function (b) {
+      if (!b) return;
+      if (b.type === 'text' && b.text) parts.push(String(b.text));
+      else if (b.type === 'document') {
+        var nm = b.title || b.name || (b.source && b.source.name) || '附件';
+        parts.push('【附件：' + nm + '】');
+      }
+    });
+    return parts.join('\n');
+  },
+
+  sessionRequestText: function (m) {
+    if (!m) return '';
+    if (m.role === 'user') return this.msgText(m);
+    return this.msgText(m);
+  },
+
+  shapeCompatible: function (a, b) {
+    if (!a || a.role !== b.role) return false;
+    var x = String(this.sessionRequestText(a) || '').trim();
+    var y = String(this.requestText(b) || '').trim();
+    if (x === y) return true;
+    // 粘贴长文本转成 txt 后，官方会话记录的 user.content 可能为空，而请求体里
+    // 是内联附件文本；这类结构差异不应阻止会话匹配。
+    if (!x && y.indexOf('【附件：') === 0) return true;
+    return false;
+  },
+
+  matchBodyPrefix: function (chain, bodyMessages) {
+    var n = 0;
+    while (n < chain.length && n < bodyMessages.length && this.shapeCompatible(chain[n], bodyMessages[n])) n++;
+    return n;
+  },
+
+  hasBridgeBlocks: function (m) {
+    var types = { thinking: 1, text: 1, server_tool_use: 1, web_search_tool_result: 1, web_fetch_tool_result: 1 };
+    return !!(m && Array.isArray(m.blocks) && m.blocks.some(function (b) { return b && types[b.type]; }));
+  },
+
+  hasToolBlocks: function (m) {
+    return !!(m && Array.isArray(m.blocks) && m.blocks.some(function (b) {
+      return b && (b.type === 'server_tool_use' || b.type === 'web_search_tool_result' || b.type === 'web_fetch_tool_result');
+    }));
+  },
+
+  sessionToRequest: function (m) {
+    if (!m) return null;
+    if (m.role === 'user') {
+      var text = this.msgText(m);
+      return text ? { role: 'user', content: text } : null;
+    }
+    if (m.role === 'assistant') {
+      var answer = (m.blocks || []).filter(function (b) { return b && b.type === 'text'; })
+        .map(function (b) { return b.text || ''; }).join('');
+      return answer ? { role: 'assistant', content: [{ type: 'text', text: answer }] } : null;
+    }
+    return null;
+  },
+
+  isRecoverableStatus: function (m) {
+    return !!(m && m.status && m.status !== 'done');
+  },
+
+  resultBlockText: function (b) {
+    if (!b) return '';
+    if (typeof b.bridge_tool_result === 'string') return b.bridge_tool_result;
+    var c = b.content;
+    if (typeof c === 'string') return c;
+    if (b.type === 'web_fetch_tool_result' && c && c.type === 'web_fetch_result') {
+      var title = c.content && c.content.title;
+      var body = c.content && c.content.content;
+      if (body == null) body = c.content;
+      if (typeof body !== 'string') body = JSON.stringify(body);
+      return String(title ? title + '\n' : '') + String(body || '');
+    }
+    try { return JSON.stringify(c); } catch (e) { return String(c == null ? '' : c); }
+  },
+
+  toolUseFromServerBlock: function (b) {
+    var input = (b && b.input) || {};
+    var name = b && b.name === 'deepseek_read_url' ? 'read_url' : 'web_search';
+    var clientInput = b && b.bridge_tool_input;
+    if (!clientInput) {
+      if (name === 'read_url') clientInput = { url: input.url || (input.queries && input.queries[0]) || '' };
+      else clientInput = { query: (input.queries && input.queries[0]) || input.query || '' };
+    }
+    return {
+      type: 'tool_use',
+      id: (b && (b.bridge_tool_id || b.id)) || ('bridge_' + Math.random().toString(36).slice(2, 12)),
+      name: name,
+      input: clientInput
+    };
+  },
+
+  /* 将官方展示块还原成第三方 Anthropic 接口可接受的消息序列。每个服务端
+   * 工具调用单独形成一对 assistant(tool_use)/user(tool_result)；未完成调用
+   * 补一条明确结果，避免悬空 tool_use。所有文本原样保留。 */
+  rebuildBridgeMessages: function (blocks) {
+    var out = [], pending = [], opened = {}, answered = {}, openOrder = [], legacy = 0;
+    var self = this;
+    (blocks || []).forEach(function (b) {
+      if (!b) return;
+      if (b.type === 'thinking' || b.type === 'text') {
+        pending.push(JSON.parse(JSON.stringify(b)));
+        return;
+      }
+      if (b.type === 'server_tool_use') {
+        var tu = self.toolUseFromServerBlock(b);
+        pending.push(tu);
+        out.push({ role: 'assistant', content: pending });
+        pending = [];
+        opened[tu.id] = true;
+        openOrder.push(tu.id);
+        return;
+      }
+      if (b.type === 'web_search_tool_result' || b.type === 'web_fetch_tool_result') {
+        var id = b.tool_use_id || ('bridge_result_' + (++legacy));
+        // 旧版失败路径把结果 id 固定成 srvtoolu_b_x，调用块却是随机 id。
+        // 若 id 对不上，按 FIFO 与最早一个未完成调用配对，保留全部内容。
+        if (!opened[id] && openOrder.length) id = openOrder.shift();
+        else if (opened[id]) {
+          var at = openOrder.indexOf(id);
+          if (at >= 0) openOrder.splice(at, 1);
+        } else {
+          id = id + '_legacy_' + (++legacy);
+          var synthetic = {
+            type: 'tool_use', id: id, name: b.type === 'web_fetch_tool_result' ? 'read_url' : 'web_search',
+            input: b.type === 'web_fetch_tool_result' ? { url: (b.content && b.content.url) || '' } : { query: '' }
+          };
+          out.push({ role: 'assistant', content: [synthetic] });
+          opened[id] = true;
+        }
+        answered[id] = true;
+        out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: self.resultBlockText(b) }] });
+      }
+    });
+    if (pending.length) out.push({ role: 'assistant', content: pending });
+    openOrder.forEach(function (id) {
+      if (!answered[id]) out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: '（上一轮在此处中断，工具未完成）' }] });
+    });
+    return out;
+  },
+
+  /* 返回注入了完整中断历史的新 body.messages；没有可恢复中断时返回 null。 */
+  recoverBridgeRequest: async function (bodyMessages) {
+    var source = (bodyMessages || []).slice();
+    var body = [], sourceIndexes = [];
+    source.forEach(function (m, i) {
+      if (m && (m.role === 'user' || m.role === 'assistant')) { body.push(m); sourceIndexes.push(i); }
+    });
+    if (!body.length) return null;
+    var sessions = await this.readSessions();
+    var best = null;
+    for (var si = 0; si < sessions.length; si++) {
+      var session = sessions[si];
+      var chain = this.chain(session);
+      var n = this.matchBodyPrefix(chain, body);
+      if (n !== body.length) continue;
+      var score = chain.length * 1000 + (session.updatedAt || 0);
+      if (!best || score > best.score) best = { session: session, chain: chain, score: score };
+    }
+
+    var target = null, mode = null, chainIndex = -1, prefixLength = -1;
+    if (best) {
+      // 重新生成：官方请求停在该轮父 user，活跃链多出一条 assistant。
+      if (best.chain.length === body.length + 1) {
+        var extra = best.chain[body.length];
+        if (extra && extra.role === 'assistant' && this.hasToolBlocks(extra) && this.isRecoverableStatus(extra)) {
+          target = extra; mode = 'insert'; chainIndex = body.length; prefixLength = body.length;
+        } else if (extra && extra.role === 'assistant') {
+          // 点击重新生成时，demo 可能先插入一条空 assistant 占位；真正要恢复的是
+          // 同一父 user 下最近一条非 done 且含工具块的历史分支。
+          var siblings = (best.session.messages || []).filter(function (m) {
+            return m && m.role === 'assistant' && m.parentId === extra.parentId && m.id !== extra.id &&
+              this.hasToolBlocks(m) && this.isRecoverableStatus(m);
+          }.bind(this)).sort(function (a, b) {
+            // error 是真正异常中断、且最需要续接的分支；stopped 可能只是用户
+            // 手动停止的旧版本。同类再按创建时间取最新。
+            var rank = function (m) { return m.status === 'error' ? 2 : (m.status === 'stopped' ? 1 : 0); };
+            return rank(b) - rank(a) || (b.createdAt || 0) - (a.createdAt || 0);
+          });
+          if (siblings.length) { target = siblings[0]; mode = 'insert'; chainIndex = body.length; prefixLength = body.length; }
+        }
+      }
+      // 中断后直接发新消息，且官方仍保留该轮：活跃 user 的父 assistant 就是目标。
+      if (!target && best.chain.length === body.length) {
+        var last = best.chain[best.chain.length - 1];
+        if (last && last.role === 'user') {
+          var parent = (best.session.messages || []).find(function (m) { return m.id === last.parentId; });
+          if (parent && parent.role === 'assistant' && this.hasToolBlocks(parent) && this.isRecoverableStatus(parent)) {
+            target = parent; mode = 'replace'; prefixLength = body.length;
+            chainIndex = best.chain.findIndex(function (m) { return m.id === parent.id; });
+          }
+        }
+      }
+    }
+
+    // 官方在“停止后直接发消息”时可能把中断轮及其父 user 整段从请求中跳过，
+    // 前缀匹配因此失败。用最后一条 user 做锚点，沿会话树向上找最近的含工具
+    // 中断轮；遇到已完成轮次立即停止，避免把旧历史注入到无关新对话。
+    if (!target && body.length && body[body.length - 1].role === 'user') {
+      var lastBodyUser = body[body.length - 1];
+      var anchorBest = null;
+      for (var ai = 0; ai < sessions.length; ai++) {
+        var as = sessions[ai], achain = this.chain(as), byId = {};
+        (as.messages || []).forEach(function (m) { byId[m.id] = m; });
+        for (var li = achain.length - 1; li >= 0; li--) {
+          if (achain[li].role !== 'user' || !this.shapeCompatible(achain[li], lastBodyUser)) continue;
+          var cur = byId[achain[li].parentId], guard = 0;
+          while (cur && guard++ < 4) {
+            if (cur.role === 'assistant') {
+              if (this.hasToolBlocks(cur) && this.isRecoverableStatus(cur)) {
+                var idx = achain.findIndex(function (m) { return m.id === cur.id; });
+                var pre = this.matchBodyPrefix(achain, body);
+                if (idx > pre) {
+                  var ascore = (cur.blocks || []).length * 1000000 + (as.updatedAt || 0);
+                  if (!anchorBest || ascore > anchorBest.score) {
+                    anchorBest = { session: as, chain: achain, score: ascore, target: cur, chainIndex: idx, prefixLength: pre };
+                  }
+                }
+                break;
+              }
+              if (cur.status === 'done') break;
+            }
+            cur = byId[cur.parentId];
+          }
+          break;
+        }
+      }
+      if (anchorBest) {
+        best = { session: anchorBest.session, chain: anchorBest.chain, score: anchorBest.score };
+        target = anchorBest.target; mode = 'anchor'; chainIndex = anchorBest.chainIndex; prefixLength = anchorBest.prefixLength;
+      }
+    }
+    if (!target) return null;
+
+    var rebuilt = this.rebuildBridgeMessages(target.blocks);
+    if (!rebuilt.length) return null;
+    // 只在原始 user/assistant 位置上注入；latest_reminder 等其它消息原样保留。
+    var messages = source.slice();
+    if (mode === 'insert') {
+      var parentFiltered = chainIndex - 1;
+      var insertAt = parentFiltered >= 0 ? sourceIndexes[parentFiltered] + 1 : 0;
+      messages.splice.apply(messages, [insertAt, 0].concat(rebuilt));
+    } else if (mode === 'anchor') {
+      var anchorAt = prefixLength < body.length ? sourceIndexes[prefixLength] : source.length;
+      var missing = best.chain.slice(prefixLength, chainIndex).map(function (m) { return this.sessionToRequest(m); }.bind(this)).filter(Boolean);
+      messages.splice.apply(messages, [anchorAt, 0].concat(missing, rebuilt));
+    } else {
+      messages.splice.apply(messages, [sourceIndexes[chainIndex], 1].concat(rebuilt));
+    }
+    return {
+      messages: messages,
+      sessionId: best.session.id,
+      targetId: target.id,
+      status: target.status,
+      mode: mode,
+      prefixLength: prefixLength,
+      recoveredMessages: rebuilt.length,
+      recoveredBlocks: (target.blocks || []).length
+    };
   }
 };
 DCP.modules.demoSearch = DemoSearch;
@@ -3015,15 +3505,16 @@ DCP.modules.tabTitle = TabTitle;
 /* ============================================================
  * main：初始化（chat-demo 第三方模型适配）
  *
- * 顺序：toolbar（工具条定位，ctxRing 要用）→ demoapi（设置面板 + fetch 补丁）
+ * 顺序：toolbar（工具条定位，ctxRing/tpsMeter 要用）→ demoapi（设置面板 + fetch 补丁）
  *       → demobridge（工具桥接，由 demoapi 的补丁触发）→ ctxRing（占用环）
- *       → demosearch / demopastetxt / tabtitle
+ *       → tpsMeter（实时速率）→ demosearch / demopastetxt / tabtitle
  * ============================================================ */
 (function () {
   var order = [
     'toolbar',
     'demoApi',
     'ctxRing',
+    'tpsMeter',
     'demoSearch',
     'demoPasteTxt',
     'tabTitle'
