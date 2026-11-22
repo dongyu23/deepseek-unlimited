@@ -152,7 +152,8 @@ var DemoBridge = {
     // 本身两种模式都声明了，缺的是这段指引
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
-      '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。';
+      '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
+      'web_search 的 query、count、need_content、ori_question 及搜索语法均由你按当前任务自行决定。';
     var searchLimit = String(DCP.config.get('demoSearchLimit') || 'unlimited');
     if (searchLimit === '1' || searchLimit === '2') {
       system += '同一轮回答中 web_search 不超过 ' + searchLimit + ' 次，尽量一次搜准。';
@@ -167,6 +168,7 @@ var DemoBridge = {
       // 时间，也没法多要结果，等于白放一半能力
       { name: 'web_search',
         description: '搜索网页获取实时信息，返回标题/链接/摘要列表。需要最新或外部信息时先用本工具。' +
+          '本工具的 query、count、need_content、ori_question 及搜索语法均由你按任务自行决定。' +
           'query 支持搜索语法（可组合）：site:example.com 限定站点；多个站点用 site:a.com OR site:b.com；' +
           '-site:x.com 排除站点；-关键词 排除；"精确短语" 精确匹配；lang:zh-CN 限定语言；' +
           'after:2026-01-01 / before:2026-06-01 限定发布时间。查近期事件时优先用 after: 收窄。',
