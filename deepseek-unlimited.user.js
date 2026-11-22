@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.5
+// @version      1.0.6
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -106,7 +106,7 @@ function pageWindow() {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = window.DCP = {
-  version: '1.0.5',
+  version: '1.0.6',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -2237,12 +2237,24 @@ var CtxRing = {
 
   update: function (data) {
     var self = this;   // 必须在方法内捕获——裸 self 会解析到浏览器全局 window.self
-    // 注意 used===0 的判定：早先用 `data.used ? data.used : data`，0 是 falsy
+    // 注意 used===0 的判定：早先用 `data.used ? data : data`，0 是 falsy
     // 会把整个对象当数字用、pct 算成 NaN（环报废）。现在按类型分流，0 正常走
     var isObj = !!data && typeof data === 'object';
     var used = isObj ? (Number(data.used) || 0) : (Number(data) || 0);
     this._last = used;
     this._data = isObj ? data : { used: used, input: used, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: used };
+    if (this._data.sessionId) {
+      this._sessionId = this._data.sessionId;
+      var all = DCP.config.sessions();
+      all[this._data.sessionId] = Object.assign({}, this._data, { savedAt: Date.now() });
+      // 只保留最近 100 个会话，避免 localStorage 无限增长。
+      var ids = Object.keys(all);
+      if (ids.length > 100) {
+        ids.sort(function (a, b) { return (all[a].savedAt || 0) - (all[b].savedAt || 0); });
+        ids.slice(0, ids.length - 100).forEach(function (id) { delete all[id]; });
+      }
+      DCP.config.saveSessions();
+    }
     var btn = document.getElementById('dcp-ctx-ring') || this.inject();
     if (!btn) return;
     var limit = this.limit();
@@ -2348,27 +2360,34 @@ var CtxRing = {
     return { used: 0, input: 0, cacheRead: 0, cacheCreate: 0, estSys: 0, estTool: 0, estMsg: 0, model: '', estimated: false };
   },
 
-  /* ---------- 会话切换感知：换了会话就没有旧会话的数据，圆圈归零 ----------
-   * demo 页「开启新对话」/点侧栏切会话都是纯客户端操作、不发任何请求（实测），
-   * ctx:api 不会因此触发——不处理的话圆圈会一直挂着上一个会话的占用，用户看到
-   * 的就是「开新会话上下文不归零」。
-   * 判据用聊天区的消息条数：它只在真切换/新对话时下降，流式期间只增不减，所以
-   * 不会误伤。别用标题元素当信号——实测流式过程中 .title-_5fa77 会闪断
-   * （移除再加回），那一下子会把刚收到的 usage 抹掉 */
-  syncSession: function () {
+  /* ---------- 会话切换感知：按官方 session ID 恢复本地占用 ----------
+   * demo 的会话 ID 只存在于 IndexedDB，URL/请求体都不带；DemoSearch.currentSession
+   * 会用 active 侧边栏项（收起时用标题 + 可见 user 文本）解析出稳定 ID。
+   * ctx:api 到来时按该 ID 写入 dcp_sessions_v1，切回时直接恢复。 */
+  syncSession: async function (force) {
     var SEL = DCP.SEL || {};
     var n = SEL.msg ? document.querySelectorAll(SEL.msg).length : 0;
-    if (n === this._msgCount) return;
+    if (n === this._msgCount && !force) return;
     var prev = this._msgCount;
     this._msgCount = n;
-    if (n < prev && this._data && (Number(this._data.used) || 0) > 0) {
-      this.update(this.emptyData());
-      this.hidePanel();
-    }
+    // 流式生成只会让消息数增加，此时不能拿旧快照覆盖刚收到的 usage。
+    if (prev != null && n > prev && !force) return;
+    var token = (this._syncToken || 0) + 1;
+    this._syncToken = token;
+    var search = DCP.modules && DCP.modules.demoSearch;
+    var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
+    if (token !== this._syncToken) return;
+    var sid = session && session.id;
+    if (sid && sid === this._sessionId) return;
+    this._sessionId = sid || null;
+    var saved = sid && DCP.config.sessions()[sid];
+    this.update(saved || this.emptyData());
+    if (!saved) this.hidePanel();
   },
 
   init: function () {
     var self = this;
+    var SEL = DCP.SEL || {};
     // 精确触发：换会话时从工具条到 view 的整条输入子树都会被换掉（实测 5 层
     // 全灭、只剩聊天内容根节点存活）——所以把 childList 观察器绑在圆圈的**整条
     // 祖先链**上（最多 8 层）：任一层的子级变动都立刻检查，活着的那个层就会
@@ -2421,7 +2440,13 @@ var CtxRing = {
       // 首帧即显示（开着自定义模型时）
       self.update(self._data || self.emptyData());
       bindPrecise();
-      DCP.on('ctx:api', function (p) { if (p && p.used > 0) self.update(p); });
+      DCP.on('ctx:api', async function (p) {
+        if (!p || !(p.used > 0)) return;
+        var search = DCP.modules && DCP.modules.demoSearch;
+        var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
+        if (session && session.id) p = Object.assign({}, p, { sessionId: session.id });
+        self.update(p);
+      });
       // 常驻显隐由「总开关 + 桥接是否活动」共同决定：关→隐藏；开且桥接在跑
       // （配了第三方端点）→立刻显示（没数据时 0%），不必等首次对话；
       // demoCustom 开着但端点是官方/未配时桥接不跑，圆圈永远拿不到数据，
@@ -2441,7 +2466,7 @@ var CtxRing = {
         }
       });
       // 工具条会随会话切换重建——保持圆圈在场。节流（带前缘）而非防抖：
-      // 防抖会被连续 DOM 变动不断重置，重建后圆圈迟迟不出现
+      // 防抖会被 DOM 变动不断重置，重建后圆圈迟迟不出现
       new MutationObserver(Utils.throttle(function () {
         if (!document.getElementById('dcp-ctx-ring')) {
           self.inject();
@@ -2450,10 +2475,14 @@ var CtxRing = {
           self.update(self._data || self.emptyData());
           bindPrecise();
         }
-        // 同一轮里顺带做会话切换感知：开新对话/切会话都不发请求，靠这个归零
-        self.syncSession();
+        // 消息数下降通常是切会话；点击监听覆盖“两条会话消息数相同”的情况。
+        self.syncSession(!self._sessionId && !!(SEL.msg && document.querySelector(SEL.msg)));
       }, 100)).observe(document.body, { childList: true, subtree: true });
-      self.syncSession();
+      document.addEventListener('click', function (e) {
+        var t = e.target && e.target.closest ? e.target.closest((DCP.SEL || {}).sidebarItem + ', button[aria-label="开启新对话"]') : null;
+        if (t) setTimeout(function () { self.syncSession(true); }, 0);
+      }, true);
+      self.syncSession(true);
     });
   }
 };
@@ -2796,6 +2825,38 @@ var DemoSearch = {
     var out = [], cur = root, guard = 0;
     while (cur && guard++ < 500) { out.push(cur); cur = cur.selectedChildId ? byId[cur.selectedChildId] : null; }
     return out;
+  },
+
+  // 当前正在查看的官方会话。侧边栏可见时用 active 项索引（与 runSearch 相同
+  // 的 updatedAt 排序）；侧边栏收起时用聊天区标题 + 可见 user 消息文本消歧。
+  currentSession: async function () {
+    var sessions = await this.readSessions();
+    sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    var SEL = DCP.SEL || {};
+    var items = SEL.sidebarItem ? Array.prototype.slice.call(document.querySelectorAll(SEL.sidebarItem)) : [];
+    var active = -1;
+    for (var i = 0; i < items.length; i++) {
+      if (/(^|\s)active-/.test(items[i].className || '')) { active = i; break; }
+    }
+    if (active >= 0 && sessions[active]) return sessions[active];
+
+    var title = SEL.chatTitle ? (document.querySelector(SEL.chatTitle)?.textContent || '').trim() : '';
+    if (!title) return null;
+    var candidates = sessions.filter(function (s) { return (s.title || '').trim() === title; });
+    if (!candidates.length) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    var domUsers = SEL.userBubble ? Array.prototype.slice.call(document.querySelectorAll(SEL.userBubble)) : [];
+    var domTexts = domUsers.map(function (el) { return (el.textContent || '').trim(); });
+    var best = null, bestScore = -1;
+    candidates.forEach(function (s) {
+      var texts = this.chain(s).filter(function (m) { return m.role === 'user'; })
+        .map(function (m) { return this.msgText(m).trim(); }.bind(this));
+      var score = 0;
+      for (var j = 0; j < domTexts.length; j++) if (texts.indexOf(domTexts[j]) >= 0) score++;
+      if (score > bestScore) { bestScore = score; best = s; }
+    }.bind(this));
+    return best || candidates[0];
   },
 
   // 一条消息的可搜文本：user=content 字符串或块数组里的 text 块（粘贴长文本

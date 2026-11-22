@@ -223,6 +223,38 @@ var DemoSearch = {
     return out;
   },
 
+  // 当前正在查看的官方会话。侧边栏可见时用 active 项索引（与 runSearch 相同
+  // 的 updatedAt 排序）；侧边栏收起时用聊天区标题 + 可见 user 消息文本消歧。
+  currentSession: async function () {
+    var sessions = await this.readSessions();
+    sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    var SEL = DCP.SEL || {};
+    var items = SEL.sidebarItem ? Array.prototype.slice.call(document.querySelectorAll(SEL.sidebarItem)) : [];
+    var active = -1;
+    for (var i = 0; i < items.length; i++) {
+      if (/(^|\s)active-/.test(items[i].className || '')) { active = i; break; }
+    }
+    if (active >= 0 && sessions[active]) return sessions[active];
+
+    var title = SEL.chatTitle ? (document.querySelector(SEL.chatTitle)?.textContent || '').trim() : '';
+    if (!title) return null;
+    var candidates = sessions.filter(function (s) { return (s.title || '').trim() === title; });
+    if (!candidates.length) return null;
+    if (candidates.length === 1) return candidates[0];
+
+    var domUsers = SEL.userBubble ? Array.prototype.slice.call(document.querySelectorAll(SEL.userBubble)) : [];
+    var domTexts = domUsers.map(function (el) { return (el.textContent || '').trim(); });
+    var best = null, bestScore = -1;
+    candidates.forEach(function (s) {
+      var texts = this.chain(s).filter(function (m) { return m.role === 'user'; })
+        .map(function (m) { return this.msgText(m).trim(); }.bind(this));
+      var score = 0;
+      for (var j = 0; j < domTexts.length; j++) if (texts.indexOf(domTexts[j]) >= 0) score++;
+      if (score > bestScore) { bestScore = score; best = s; }
+    }.bind(this));
+    return best || candidates[0];
+  },
+
   // 一条消息的可搜文本：user=content 字符串或块数组里的 text 块（粘贴长文本
   // 转成 txt 附件后就是数组，早前只认字符串、那条消息会搜不到）；
   // assistant=text 块拼接（thinking/工具块不搜——官方可见结果同样只有正文）
