@@ -85,14 +85,36 @@ var TpsMeter = {
     this.render();
   },
 
+  saveLast: async function () {
+    if (!this._last) return;
+    var sid = DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId;
+    if (!sid) {
+      var search = DCP.modules && DCP.modules.demoSearch;
+      var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
+      sid = session && session.id;
+    }
+    if (!sid) return;
+    var all = DCP.config.sessions();
+    all[sid] = Object.assign({}, all[sid], { tps: this._last, savedAt: Date.now() });
+    DCP.config.saveSessions();
+  },
+
+  restore: function (sid) {
+    var saved = sid && DCP.config.sessions()[sid];
+    this._last = saved && saved.tps ? saved.tps : null;
+    this._active = false;
+    this.render();
+  },
+
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.inject();
       self.render();
       DCP.on('tps:start', function () { self.start(); });
-      DCP.on('tps:update', function (p) { self.paint(p); });
+      DCP.on('tps:update', async function (p) { self.paint(p); await self.saveLast(); });
       DCP.on('tps:idle', function () { self.idle(); });
+      DCP.on('session:change', function (e) { self.restore(e && e.sessionId); });
       DCP.on('cfg:change', function (e) {
         if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowTps') {
           self.render();

@@ -94,7 +94,7 @@ var CtxRing = {
     if (this._data.sessionId) {
       this._sessionId = this._data.sessionId;
       var all = DCP.config.sessions();
-      all[this._data.sessionId] = Object.assign({}, this._data, { savedAt: Date.now() });
+      all[this._data.sessionId] = Object.assign({}, all[this._data.sessionId], this._data, { savedAt: Date.now() });
       // 只保留最近 100 个会话，避免 localStorage 无限增长。
       var ids = Object.keys(all);
       if (ids.length > 100) {
@@ -228,6 +228,7 @@ var CtxRing = {
     var sid = session && session.id;
     if (sid && sid === this._sessionId) return;
     this._sessionId = sid || null;
+    DCP.emit('session:change', { sessionId: this._sessionId });
     var saved = sid && DCP.config.sessions()[sid];
     this.update(saved || this.emptyData());
     if (!saved) this.hidePanel();

@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.8
+// @version      1.0.9
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -106,7 +106,7 @@ function pageWindow() {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = window.DCP = {
-  version: '1.0.8',
+  version: '1.0.9',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -1463,8 +1463,7 @@ var DemoBridge = {
     // 本身两种模式都声明了，缺的是这段指引
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
-      '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
-      'web_search 的 count 要按任务复杂度动态选择：简单查询 1~3 条，中等查询 5~10 条，复杂调研 20~50 条，不要无脑固定为 10 条。';
+      '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。';
     var searchLimit = String(DCP.config.get('demoSearchLimit') || 'unlimited');
     if (searchLimit === '1' || searchLimit === '2') {
       system += '同一轮回答中 web_search 不超过 ' + searchLimit + ' 次，尽量一次搜准。';
@@ -1486,7 +1485,7 @@ var DemoBridge = {
           type: 'object',
           properties: {
             query: { type: 'string', description: '搜索词，1~128 个字符，支持 site: / -site: / -排除词 / "精确短语" / lang: / after: / before: 语法' },
-            count: { type: 'integer', description: '按任务复杂度动态选择返回条数：简单查询 1~3，中等查询 5~10，复杂调研 20~50。条数不影响费用，不要无脑固定为 10' },
+            count: { type: 'integer', description: '返回条数，1~50。条数不影响费用，可按需选择' },
             need_content: { type: 'boolean', description: '是否在结果中返回网页正文，默认 false。需要引用原文细节时设 true' },
             ori_question: { type: 'string', description: '触发本次搜索的用户原始问题，1~128 字符，能帮助搜索服务理解意图' }
           },
@@ -2267,7 +2266,7 @@ var CtxRing = {
     if (this._data.sessionId) {
       this._sessionId = this._data.sessionId;
       var all = DCP.config.sessions();
-      all[this._data.sessionId] = Object.assign({}, this._data, { savedAt: Date.now() });
+      all[this._data.sessionId] = Object.assign({}, all[this._data.sessionId], this._data, { savedAt: Date.now() });
       // 只保留最近 100 个会话，避免 localStorage 无限增长。
       var ids = Object.keys(all);
       if (ids.length > 100) {
@@ -2401,6 +2400,7 @@ var CtxRing = {
     var sid = session && session.id;
     if (sid && sid === this._sessionId) return;
     this._sessionId = sid || null;
+    DCP.emit('session:change', { sessionId: this._sessionId });
     var saved = sid && DCP.config.sessions()[sid];
     this.update(saved || this.emptyData());
     if (!saved) this.hidePanel();
@@ -2597,14 +2597,36 @@ var TpsMeter = {
     this.render();
   },
 
+  saveLast: async function () {
+    if (!this._last) return;
+    var sid = DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId;
+    if (!sid) {
+      var search = DCP.modules && DCP.modules.demoSearch;
+      var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
+      sid = session && session.id;
+    }
+    if (!sid) return;
+    var all = DCP.config.sessions();
+    all[sid] = Object.assign({}, all[sid], { tps: this._last, savedAt: Date.now() });
+    DCP.config.saveSessions();
+  },
+
+  restore: function (sid) {
+    var saved = sid && DCP.config.sessions()[sid];
+    this._last = saved && saved.tps ? saved.tps : null;
+    this._active = false;
+    this.render();
+  },
+
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.inject();
       self.render();
       DCP.on('tps:start', function () { self.start(); });
-      DCP.on('tps:update', function (p) { self.paint(p); });
+      DCP.on('tps:update', async function (p) { self.paint(p); await self.saveLast(); });
       DCP.on('tps:idle', function () { self.idle(); });
+      DCP.on('session:change', function (e) { self.restore(e && e.sessionId); });
       DCP.on('cfg:change', function (e) {
         if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowTps') {
           self.render();
