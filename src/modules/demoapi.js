@@ -27,7 +27,7 @@
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -494,6 +494,11 @@ var DemoApi = {
       advBox.style.display = open ? 'none' : 'block';
       advArrow.style.transform = open ? '' : 'rotate(180deg)';
     });
+    // 每轮搜索次数上限：默认不限制，预算紧的用户可显式限制。
+    var SEARCH_LIMIT_TITLE = DCP.t('每轮回答中 web_search 的次数上限。unlimited=不限制，适合预算充裕、需要多轮检索的任务；2=最多两次；1=最多一次，适合节省预算。');
+    var SEARCH_LIMIT_DESC = DCP.t('unlimited：不限制（默认）；2：每轮最多两次；1：每轮最多一次');
+    advBox.appendChild(withDesc(mkSelect('每轮搜索次数上限', 'searchLimit',
+      [['unlimited', 'unlimited：不限制'], ['2', '2：最多两次'], ['1', '1：最多一次']], 'unlimited', SEARCH_LIMIT_TITLE), SEARCH_LIMIT_DESC));
     // 工具调用方式：选项文本已自明（native：模型自己搜 / searchapi：只付搜索费），
     // 可见描述行给一句人话结论，完整差异（计费/能力）放 hover 提示
     var TOOLMODE_TITLE = DCP.t('模型要搜索时，谁来执行：native=交给 DeepSeek 的模型在对话里完成，能多轮搜、能读网页，但每轮搜索另付约 2 分钱模型费；searchapi=直接调 DeepSeek 的搜索接口，一次约 0.00075 美元、不经模型，搜什么由当前模型决定。两种在界面上看起来一样');

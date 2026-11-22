@@ -155,7 +155,14 @@ var DemoBridge = {
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
       '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
-      '同一轮回答中 web_search 不超过 2 次，尽量一次搜准。调用工具前不要输出面向用户的文本。';
+      'web_search 的 count 要按任务复杂度动态选择：简单查询 1~3 条，中等查询 5~10 条，复杂调研 20~50 条，不要无脑固定为 10 条。';
+    var searchLimit = String(DCP.config.get('demoSearchLimit') || 'unlimited');
+    if (searchLimit === '1' || searchLimit === '2') {
+      system += '同一轮回答中 web_search 不超过 ' + searchLimit + ' 次，尽量一次搜准。';
+    } else {
+      system += '同一轮回答中的 web_search 次数不限制，可按任务需要持续检索。';
+    }
+    system += '调用工具前不要输出面向用户的文本。';
     var tools = [
       // web_search 的参数口径与 DeepSeek Search API 对齐（2026-11-19 按其文档补全）：
       // query 1~128 字符且支持整套搜索语法；count 1~50 且**不影响费用**（按次计费，
@@ -170,7 +177,7 @@ var DemoBridge = {
           type: 'object',
           properties: {
             query: { type: 'string', description: '搜索词，1~128 个字符，支持 site: / -site: / -排除词 / "精确短语" / lang: / after: / before: 语法' },
-            count: { type: 'integer', description: '返回条数，1~50，默认 10。条数不影响费用，可按需多要' },
+            count: { type: 'integer', description: '按任务复杂度动态选择返回条数：简单查询 1~3，中等查询 5~10，复杂调研 20~50。条数不影响费用，不要无脑固定为 10' },
             need_content: { type: 'boolean', description: '是否在结果中返回网页正文，默认 false。需要引用原文细节时设 true' },
             ori_question: { type: 'string', description: '触发本次搜索的用户原始问题，1~128 字符，能帮助搜索服务理解意图' }
           },
@@ -259,7 +266,7 @@ var DemoBridge = {
     var ti = toolInput || {};
     var q = isRead ? String(ti.url || '') : String(ti.query || '').slice(0, 128);
     if (!q) return Promise.reject(new Error('empty input'));
-    // count：按模型给的走，夹在 API 允许的 1~50；按次计费，多要不加钱
+    // count：按模型给的走，夹在 API 允许的 1~50；按次计费，多不加钱。
     var cnt = parseInt(ti.count, 10);
     if (!(cnt >= 1)) cnt = 10;
     if (cnt > 50) cnt = 50;

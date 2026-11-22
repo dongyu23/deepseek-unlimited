@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.7
+// @version      1.0.8
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -106,7 +106,7 @@ function pageWindow() {
 
 /* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = window.DCP = {
-  version: '1.0.7',
+  version: '1.0.8',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -165,6 +165,7 @@ var DEFAULT_CONFIG = {
   demoCtxLimit: 128000,                   // 上下文窗口（tokens，占用环百分比用；可填 128000 / 128k / 1m）
   demoShowCtxRing: true,                  // 是否在工具条显示上下文占用环
   demoShowTps: false,                     // 是否在工具条显示实时输出速率
+  demoSearchLimit: 'unlimited',           // 每轮 web_search 次数上限：unlimited / 2 / 1
   demoToolMode: 'native',                // 工具调用方式：native=DeepSeek 模型驱动搜索（含模型 token 费）/ searchapi=直调搜索 API（仅付搜索费）
   demoBridge: 'auto',                    // 工具桥接：auto(端点非 deepseek 即启用) / on / off
   demoTitleSource: 'deepseek'            // 会话标题来源：deepseek=官方端点起名腿 / model=自定义模型起名 / off=首条消息截断
@@ -436,6 +437,12 @@ var I18N = {
     'API 端点': 'API endpoint',
     '自定义模型': 'Custom model',
     '工具调用方式': 'Tool invocation',
+    '每轮搜索次数上限': 'Search limit per turn',
+    'unlimited：不限制': 'unlimited: no limit',
+    '2：最多两次': '2: at most two',
+    '1：最多一次': '1: at most one',
+    '每轮回答中 web_search 的次数上限。unlimited=不限制，适合预算充裕、需要多轮检索的任务；2=最多两次；1=最多一次，适合节省预算。': 'Maximum web_search calls per assistant turn. unlimited = no limit for research-heavy tasks with ample budget; 2 = at most two; 1 = at most one for tighter budgets.',
+    'unlimited：不限制（默认）；2：每轮最多两次；1：每轮最多一次': 'unlimited: no limit (default); 2: at most two per turn; 1: at most one per turn',
     '只填消息接口地址：到 /messages 为止，不要包含 /messages 本身（例：https://api.stepfun.com/step_plan/v1）。留空 = 官方 https://api.deepseek.com/anthropic/v1': 'Messages endpoint only: up to but excluding /messages itself (e.g. https://api.stepfun.com/step_plan/v1). Leave empty for the official https://api.deepseek.com/anthropic/v1',
     '模型要搜索时，谁来执行：native=交给 DeepSeek 的模型在对话里完成，能多轮搜、能读网页，但每轮搜索另付约 2 分钱模型费；searchapi=直接调 DeepSeek 的搜索接口，一次约 0.00075 美元、不经模型，搜什么由当前模型决定。两种在界面上看起来一样': 'Who runs the search when the model asks for one: native = the DeepSeek model does it inside the conversation (multi-round search and page reads; each round costs about 2 cents in model tokens). searchapi = call the DeepSeek search API directly, about $0.00075 per call, no model involved; the current model decides what to search. Both look identical in the UI',
     '模型要搜索时谁来执行：native=DeepSeek 的模型自己搜，另付约 2 分钱/轮模型费；searchapi=直调搜索接口，每次约 0.00075 美元、不经模型': 'Who runs a search when the model asks: native = the DeepSeek model searches itself (about 2 cents per round in model fees); searchapi = call the search API directly (about $0.00075 per call, no model involved)',
@@ -651,7 +658,7 @@ DCP.modules.toolbar = Toolbar;
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
@@ -1118,6 +1125,11 @@ var DemoApi = {
       advBox.style.display = open ? 'none' : 'block';
       advArrow.style.transform = open ? '' : 'rotate(180deg)';
     });
+    // 每轮搜索次数上限：默认不限制，预算紧的用户可显式限制。
+    var SEARCH_LIMIT_TITLE = DCP.t('每轮回答中 web_search 的次数上限。unlimited=不限制，适合预算充裕、需要多轮检索的任务；2=最多两次；1=最多一次，适合节省预算。');
+    var SEARCH_LIMIT_DESC = DCP.t('unlimited：不限制（默认）；2：每轮最多两次；1：每轮最多一次');
+    advBox.appendChild(withDesc(mkSelect('每轮搜索次数上限', 'searchLimit',
+      [['unlimited', 'unlimited：不限制'], ['2', '2：最多两次'], ['1', '1：最多一次']], 'unlimited', SEARCH_LIMIT_TITLE), SEARCH_LIMIT_DESC));
     // 工具调用方式：选项文本已自明（native：模型自己搜 / searchapi：只付搜索费），
     // 可见描述行给一句人话结论，完整差异（计费/能力）放 hover 提示
     var TOOLMODE_TITLE = DCP.t('模型要搜索时，谁来执行：native=交给 DeepSeek 的模型在对话里完成，能多轮搜、能读网页，但每轮搜索另付约 2 分钱模型费；searchapi=直接调 DeepSeek 的搜索接口，一次约 0.00075 美元、不经模型，搜什么由当前模型决定。两种在界面上看起来一样');
@@ -1452,7 +1464,14 @@ var DemoBridge = {
     system += '\n\n你可以使用 web_search / read_url 工具获取实时信息，结果会以 tool_result 返回。' +
       '需要最新或外部信息时必须调用工具，不要凭空回答。两个工具配合使用：先用 web_search 找到相关网页，' +
       '需要核实细节（日期、数字、原文表述）时再用 read_url 读取其中网页全文。' +
-      '同一轮回答中 web_search 不超过 2 次，尽量一次搜准。调用工具前不要输出面向用户的文本。';
+      'web_search 的 count 要按任务复杂度动态选择：简单查询 1~3 条，中等查询 5~10 条，复杂调研 20~50 条，不要无脑固定为 10 条。';
+    var searchLimit = String(DCP.config.get('demoSearchLimit') || 'unlimited');
+    if (searchLimit === '1' || searchLimit === '2') {
+      system += '同一轮回答中 web_search 不超过 ' + searchLimit + ' 次，尽量一次搜准。';
+    } else {
+      system += '同一轮回答中的 web_search 次数不限制，可按任务需要持续检索。';
+    }
+    system += '调用工具前不要输出面向用户的文本。';
     var tools = [
       // web_search 的参数口径与 DeepSeek Search API 对齐（2026-11-19 按其文档补全）：
       // query 1~128 字符且支持整套搜索语法；count 1~50 且**不影响费用**（按次计费，
@@ -1467,7 +1486,7 @@ var DemoBridge = {
           type: 'object',
           properties: {
             query: { type: 'string', description: '搜索词，1~128 个字符，支持 site: / -site: / -排除词 / "精确短语" / lang: / after: / before: 语法' },
-            count: { type: 'integer', description: '返回条数，1~50，默认 10。条数不影响费用，可按需多要' },
+            count: { type: 'integer', description: '按任务复杂度动态选择返回条数：简单查询 1~3，中等查询 5~10，复杂调研 20~50。条数不影响费用，不要无脑固定为 10' },
             need_content: { type: 'boolean', description: '是否在结果中返回网页正文，默认 false。需要引用原文细节时设 true' },
             ori_question: { type: 'string', description: '触发本次搜索的用户原始问题，1~128 字符，能帮助搜索服务理解意图' }
           },
@@ -1556,7 +1575,7 @@ var DemoBridge = {
     var ti = toolInput || {};
     var q = isRead ? String(ti.url || '') : String(ti.query || '').slice(0, 128);
     if (!q) return Promise.reject(new Error('empty input'));
-    // count：按模型给的走，夹在 API 允许的 1~50；按次计费，多要不加钱
+    // count：按模型给的走，夹在 API 允许的 1~50；按次计费，多不加钱。
     var cnt = parseInt(ti.count, 10);
     if (!(cnt >= 1)) cnt = 10;
     if (cnt > 50) cnt = 50;
