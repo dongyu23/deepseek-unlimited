@@ -93,7 +93,7 @@ var DCP = {
   bridge: Bridge,
   modules: {},
   _ev: {},
-  on: function (name, fn) { (this._ev[name] || []).push(fn); },
+  on: function (name, fn) { (this._ev[name] || (this._ev[name] = [])).push(fn); },
   emit: function (name, payload) {
     var list = this._ev[name] || [];
     for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) { console.error('[DCP]', name, e); } }

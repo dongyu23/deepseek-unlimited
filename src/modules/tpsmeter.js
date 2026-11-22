@@ -69,30 +69,37 @@ var TpsMeter = {
     el.style.display = this.canShow() ? 'inline-flex' : 'none';
   },
 
-  start: function () {
+  start: function (payload) {
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+        !tracker.isRequestCurrent(payload)) return;
     this._active = true;
     this.render();
   },
 
-  paint: function (data) {
+  paint: function (data, payload) {
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+        !tracker.isRequestCurrent(payload)) return;
     if (data && data.tps > 0) this._last = data;
     this._active = true;
     this.render();
   },
 
-  idle: function () {
+  idle: function (payload) {
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+        !tracker.isRequestCurrent(payload)) return;
     this._active = false;
     this.render();
+    // 只在请求收尾时持久化一次权威/最终均值，避免 250ms 实时更新把整个
+    // 会话表反复序列化并同步写 GM_setValue。
+    this.saveLast(payload && payload.sessionId);
   },
 
-  saveLast: async function () {
+  saveLast: function (sid) {
     if (!this._last) return;
-    var sid = DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId;
-    if (!sid) {
-      var search = DCP.modules && DCP.modules.demoSearch;
-      var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
-      sid = session && session.id;
-    }
+    sid = sid || (DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId);
     if (!sid) return;
     var all = DCP.config.sessions();
     all[sid] = Object.assign({}, all[sid], { tps: this._last, savedAt: Date.now() });
@@ -111,9 +118,9 @@ var TpsMeter = {
     Utils.onReady(function () {
       self.inject();
       self.render();
-      DCP.on('tps:start', function () { self.start(); });
-      DCP.on('tps:update', async function (p) { self.paint(p); await self.saveLast(); });
-      DCP.on('tps:idle', function () { self.idle(); });
+      DCP.on('tps:start', function (p) { self.start(p); });
+      DCP.on('tps:update', function (p) { if (p) self.paint(p, p); });
+      DCP.on('tps:idle', function (p) { self.idle(p); });
       DCP.on('session:change', function (e) { self.restore(e && e.sessionId); });
       DCP.on('cfg:change', function (e) {
         if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowTps') {

@@ -1,12 +1,12 @@
 /* ============================================================
  * modules/ctxring：自定义模型时的上下文占用圆圈（ZCode 式精简环）
  *
- * 数据来源：demobridge 在每次交换结束后从响应 usage 算出精确占用
- * （input + cache_read + cache_creation = 本次请求模型实际收到的全部
- * 内容：系统提示/工具定义/完整历史——非文本估算），经 'ctx:api' 事件
- * 广播。本模块只负责把占用/窗口画成一个环，注入在输入工具条里、
- * 发送按钮一侧。常驻显示：配了第三方端点（桥接活动）就在（首次对话前显示
- * 0%），总开关关、或端点是官方/未配（桥接不跑、永远没有数据）时隐藏。
+ * 数据来源：demobridge 在每轮工具结果追加后按当前 messages 估算，并在最终
+ * 轮优先采用响应 usage 的精确值，经 'ctx:api' 事件广播。事件自带请求发起时
+ * 固定的 sessionId/requestId；切会话后过期事件直接丢弃。本模块只负责把
+ * 占用/窗口画成一个环，注入在输入工具条里、发送按钮一侧。配了第三方端点
+ * （桥接活动）时常驻显示（首次对话前显示 0%）；总开关关、或端点是官方/
+ * 未配（桥接不跑、永远没有数据）时隐藏。
  * ============================================================ */
 var CtxRing = {
   SIZE: 22, R: 8.5,
@@ -227,6 +227,20 @@ var CtxRing = {
     if (token !== this._syncToken) return;
     var sid = session && session.id;
     if (sid && sid === this._sessionId) return;
+    if (sid !== this._sessionId) {
+      var tracker = DCP.modules && DCP.modules.demoSearch;
+      // 新会话首个请求发起时 IndexedDB 往往还没落盘，request 的 sessionId
+      // 可能暂时为 null，也可能已经解析出来但 ctxRing 自己还是 null。随后
+      // syncSession 识别出同一个会话属于身份补全，不是用户切会话，不能递增
+      // 纪元把该请求自己的 TPS/ctx 事件全部丢掉。
+      var completingRequest = !this._sessionId && !!sid && tracker && (
+        (typeof tracker.hasPendingRequestForSession === 'function' && tracker.hasPendingRequestForSession(sid)) ||
+        (typeof tracker.hasPendingAnonymousRequest === 'function' && tracker.hasPendingAnonymousRequest())
+      );
+      if (!completingRequest && tracker && typeof tracker.invalidateRequests === 'function') {
+        tracker.invalidateRequests();
+      }
+    }
     this._sessionId = sid || null;
     DCP.emit('session:change', { sessionId: this._sessionId });
     var saved = sid && DCP.config.sessions()[sid];
@@ -289,11 +303,11 @@ var CtxRing = {
       // 首帧即显示（开着自定义模型时）
       self.update(self._data || self.emptyData());
       bindPrecise();
-      DCP.on('ctx:api', async function (p) {
+      DCP.on('ctx:api', function (p) {
         if (!p || !(p.used > 0)) return;
-        var search = DCP.modules && DCP.modules.demoSearch;
-        var session = search && typeof search.currentSession === 'function' ? await search.currentSession() : null;
-        if (session && session.id) p = Object.assign({}, p, { sessionId: session.id });
+        var tracker = DCP.modules && DCP.modules.demoSearch;
+        if (p.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+            !tracker.isRequestCurrent(p)) return;
         self.update(p);
       });
       // 常驻显隐由「总开关 + 桥接是否活动」共同决定：关→隐藏；开且桥接在跑
@@ -329,7 +343,17 @@ var CtxRing = {
       }, 100)).observe(document.body, { childList: true, subtree: true });
       document.addEventListener('click', function (e) {
         var t = e.target && e.target.closest ? e.target.closest((DCP.SEL || {}).sidebarItem + ', button[aria-label="开启新对话"]') : null;
-        if (t) setTimeout(function () { self.syncSession(true); }, 0);
+        if (t) {
+          // 点击当前会话不应打断正在生成的数据；切到别的会话/新建会话必须在
+          // 异步 currentSession 解析前立刻递增纪元，拒绝上一请求的迟到事件。
+          var activeSel = (DCP.SEL || {}).sidebarItemActive;
+          var sameActive = !!(activeSel && t.matches && t.matches(activeSel));
+          if (!sameActive) {
+            var tracker = DCP.modules && DCP.modules.demoSearch;
+            if (tracker && typeof tracker.invalidateRequests === 'function') tracker.invalidateRequests();
+          }
+          setTimeout(function () { self.syncSession(true); }, 0);
+        }
       }, true);
       self.syncSession(true);
     });
