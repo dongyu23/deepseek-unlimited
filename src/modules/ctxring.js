@@ -316,6 +316,7 @@ var CtxRing = {
             self.inject();
             self.update(self._data || self.emptyData());
             bindPrecise();          // 新链可能变了——重新绑
+            DCP.emit('toolbar:rebuild');   // 同一条工具条上的速率读数跟着在同一帧补回
           });
           mo.observe(host, { childList: true });
           self._barMos.push(mo);
@@ -334,6 +335,7 @@ var CtxRing = {
           self.inject();
           self.update(self._data || self.emptyData());
           bindPrecise();
+          DCP.emit('toolbar:rebuild');
         });
         moTop.observe(top, { childList: true, subtree: true });
         self._barMos.push(moTop);
@@ -378,6 +380,7 @@ var CtxRing = {
           if (!self.hasSessionDom() && self._sessionId) self.resetForNewChat();
           else self.update(!self.hasSessionDom() ? self.emptyData() : (self._data || self.emptyData()));
           bindPrecise();
+          DCP.emit('toolbar:rebuild');
         }
         // 消息数下降通常是切会话；点击监听覆盖“两条会话消息数相同”的情况。
         self.syncSession(!self._sessionId && !!(SEL.msg && document.querySelector(SEL.msg)));
@@ -405,6 +408,9 @@ var CtxRing = {
           if (!sameActive && !isNewChat) {
             var tracker = DCP.modules && DCP.modules.demoSearch;
             if (tracker && typeof tracker.invalidateRequests === 'function') tracker.invalidateRequests();
+            // 新会话 id 要等异步解析才有，这期间屏上已经是别的会话了——先通知
+            // 速率读数清空，别继续顶着旧会话的数字
+            DCP.emit('session:leave');
           }
           setTimeout(function () { self.syncSession(true); }, 0);
         }

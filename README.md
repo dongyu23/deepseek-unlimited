@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-4D6BFE" alt="version 1.0.0">
+  <img src="https://img.shields.io/badge/version-1.0.15-4D6BFE" alt="version 1.0.15">
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="license MIT">
   <img src="https://img.shields.io/github/stars/dongyu23/deepseek-unlimited?style=flat&color=4D6BFE" alt="GitHub stars">
   <img src="https://img.shields.io/badge/Tampermonkey-4.x%2B-f59e0b" alt="Tampermonkey 4.x+">
-  <img src="https://img.shields.io/badge/userscript-180KB-6366f1" alt="script size">
+  <img src="https://img.shields.io/badge/userscript-200KB-6366f1" alt="script size">
 </p>
 
 > 2026-11-16 起，DeepSeek 因算力紧张对 **C 端免费用户**实施限额：超 7 天不活跃的长对话不能续、单次输入从 8 万字砍到 **4 万字**、每日对话额度触顶后只回「服务器繁忙，使用额度已达上限」——相关话题连续登上热搜。

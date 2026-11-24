@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.14
+// @version      1.0.15
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -108,7 +108,7 @@ function pageWindow() {
  * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
  * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
 var DCP = {
-  version: '1.0.14',
+  version: '1.0.15',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -1971,6 +1971,72 @@ var DemoBridge = {
       if (search && typeof search.finishRequest === 'function' && requestCtx) search.finishRequest(requestCtx.requestId);
     };
 
+    /* ---------- 实时速率（按整个请求累计） ----------
+     * 以前每轮从头重算，多轮工具循环里数字先跳高再往下走、每换一轮重来一遍；
+     * 实时值又是按字数估的，轮末拿到接口 usage 才换成精确值，两个口径对不上，
+     * 收尾时猛跳一下（实测 196 → 108）。现在：
+     *  - 按整个请求累计：已结束的轮用接口 usage 的精确 output_tokens，在途的
+     *    这一轮优先也用精确值——StepFun 这类端点每个 delta 上都带累计
+     *    usage.output_tokens（2026-11-24 抓原始流确认）；端点不带才退回按字数
+     *    估算。两者加总除以累计生成用时（不含工具腿等待）；
+     *  - 显示值向目标值指数逼近（时间常数 0.45s）：目标缓变时基本跟手，遇到
+     *    估算值被精确值替换这类阶跃则平滑过渡；
+     *  - 计时器按请求走，工具腿等待期间也继续发，显示值才能走完这段过渡。 */
+    var tps = {
+      authTokens: 0,      // 已结束各轮的输出 token 之和
+      authExact: true,    // 上述是否全部来自接口 usage
+      genTime: 0,         // 已结束各轮的生成用时之和（秒）
+      liveTokens: 0,      // 在途这一轮按字数估的 token
+      liveAuth: 0,        // 在途这一轮接口回的累计 output_tokens
+      liveTrusted: false, // liveAuth 可否当精确值用（见 pump 回调里的采信规则）
+      roundStart: 0,      // 在途这一轮的起点；0 = 当前不在生成中
+      shown: 0, hasShown: false, lastTick: 0, lastEmit: 0, timer: null
+    };
+    // 在途这一轮的精确输出量：接口给了就用，没给返回 0（调用方退回估算值）
+    var tpsLiveExact = function () { return tps.liveTrusted ? tps.liveAuth : 0; };
+    var tpsTarget = function () {
+      var exact = tpsLiveExact();
+      var live = exact > 0 ? exact : tps.liveTokens;
+      var elapsed = tps.genTime + (tps.roundStart ? (performance.now() - tps.roundStart) / 1000 : 0);
+      var tokens = tps.authTokens + live;
+      if (!(elapsed > 0) || !(tokens > 0)) return null;
+      return {
+        tps: tokens / elapsed, tokens: tokens, elapsed: elapsed,
+        // 工具腿等待期间没有在途轮：已结束各轮全是精确值，这个数就是精确的
+        estimated: !(tps.authExact && (!tps.roundStart || exact > 0))
+      };
+    };
+    var tpsEmit = function (force) {
+      var t = tpsTarget();
+      if (!t) return;
+      var now = performance.now();
+      if (!tps.hasShown) { tps.shown = t.tps; tps.hasShown = true; }
+      else if (now > tps.lastTick) {
+        tps.shown += (t.tps - tps.shown) * (1 - Math.exp(-(now - tps.lastTick) / 450));
+      }
+      tps.lastTick = now;
+      if (!force && now - tps.lastEmit < 200) return;
+      tps.lastEmit = now;
+      // tps 是平滑后的显示值；tokens / elapsed 是真实累计量（浮层提示用）
+      DCP.emit('tps:update', eventMeta({ tps: tps.shown, tokens: t.tokens, elapsed: t.elapsed, estimated: t.estimated }));
+    };
+    // 一轮结束：记进请求累计。接口没给 usage 的轮退回估算值，并把精确标记摘掉
+    var tpsCloseRound = function () {
+      var exact = tpsLiveExact();
+      if (exact > 0) tps.authTokens += exact;
+      else if (tps.liveTokens > 0) { tps.authTokens += tps.liveTokens; tps.authExact = false; }
+      tps.genTime += tps.roundStart ? (performance.now() - tps.roundStart) / 1000 : 0;
+      tps.roundStart = 0; tps.liveTokens = 0; tps.liveAuth = 0; tps.liveTrusted = false;
+    };
+    // 请求收尾：停计时器，把未经平滑的最终值发出去（「平均」要的是精确值），
+    // 再通知空闲
+    var tpsIdle = function () {
+      if (tps.timer) { clearInterval(tps.timer); tps.timer = null; }
+      var t = tpsTarget();
+      if (t) DCP.emit('tps:update', eventMeta({ tps: t.tps, tokens: t.tokens, elapsed: t.elapsed, estimated: t.estimated, final: true }));
+      DCP.emit('tps:idle', eventMeta());
+    };
+
     // 官方 demo 会把工具块从下一次 API 请求里过滤掉，但它自己的 IndexedDB
     // 仍完整保存着这些块。只从请求发起时唯一确定的当前会话恢复中断轮，
     // 不另建存储、不截断内容，也不扫描其它会话。
@@ -2118,35 +2184,15 @@ var DemoBridge = {
               }, {})
             });
             push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
-            DCP.emit('tps:idle', eventMeta());
+            tpsIdle();
             endRequest();
             finish(); return;
           }
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
           var roundUsage = null, roundStop = 'end_turn', respModel = '';
-          var tpsStart = 0, tpsLiveTokens = 0, tpsLastEmit = 0, tpsTimer = null;
-          var emitTps = function (authoritative, force) {
-            if (!tpsStart) return;
-            var elapsed = (performance.now() - tpsStart) / 1000;
-            if (!(elapsed > 0)) return;
-            // 只有端点确实回了有效 output_tokens 才算精确；否则即使调用方
-            // 请求“权威收尾”，也必须明确标记为本地估算，不能把估算值冒充
-            // 接口 usage 精确值。
-            var hasAuthoritative = !!(authoritative && roundUsage && Number(roundUsage.output_tokens) > 0);
-            var tokens = hasAuthoritative ? Number(roundUsage.output_tokens) : tpsLiveTokens;
-            if (!(tokens > 0)) return;
-            var now = performance.now();
-            if (!force && now - tpsLastEmit < 200) return;
-            tpsLastEmit = now;
-            DCP.emit('tps:update', eventMeta({
-              tps: tokens / elapsed,
-              tokens: tokens,
-              elapsed: elapsed,
-              estimated: !hasAuthoritative
-            }));
-          };
-          tpsTimer = setInterval(function () { emitTps(false, false); }, 250);
+          // 速率计时器按请求走（见 intercept 开头 tps 注释）：首轮起一次，收尾 tpsIdle() 清
+          if (!tps.timer) tps.timer = setInterval(function () { tpsEmit(); }, 250);
           // usage 合并：Anthropic 系把 input 类放在 message_start.message.usage、
           // output 放在 message_delta.usage，很多第三方端点只给其中一个——
           // 以前只读 message_delta，遇到「只在 message_start 给 input_tokens」
@@ -2158,55 +2204,66 @@ var DemoBridge = {
               if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
             });
           };
-          await (async function () {
-            try {
-              await self.pump(resp.body, function (j) {
-                if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
-                if (j.type === 'message_start') {
-                  tpsStart = performance.now();
-                  tpsLiveTokens = 0;
-                  tpsLastEmit = 0;
-                }
-                if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
-                if (j.type === 'content_block_start') {
-                  var cb = j.content_block || {};
-                  var b = { type: cb.type, raw: cb, index: nextIdx() };
-                  blocks.push(b); partial[b.index] = '';
-                  if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
-                    push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
-                  }
-                } else if (j.type === 'content_block_delta') {
-                  var d = j.delta || {};
-                  var blk = blocks[blocks.length - 1];
-                  if (!blk) return;
-                  if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
-                  if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
-                    if (blk.type === 'tool_use') return;
-                    if (d.type === 'text_delta') tpsLiveTokens += Utils.estimateTokens(d.text || '');
-                    else if (d.type === 'thinking_delta') tpsLiveTokens += Utils.estimateTokens(d.thinking || '');
-                    push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
-                  }
-                } else if (j.type === 'content_block_stop') {
-                  var b2 = blocks[blocks.length - 1];
-                  if (b2) {
-                    if (b2.type === 'tool_use') {
-                      try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
-                    }
-                    push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
-                  }
-                } else if (j.type === 'message_delta') {
-                  mergeUsage(j.usage);
-                  if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
-                  if (blocks.some(function (b) { return b.type === 'thinking' || b.type === 'text'; })) emitTps(true, false);
-                }
-              }, ac.signal);
-            } finally {
-              if (tpsTimer) { clearInterval(tpsTimer); tpsTimer = null; }
+          await self.pump(resp.body, function (j) {
+            if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'message_start') {
+              tps.roundStart = performance.now();
+              tps.liveTokens = 0; tps.liveAuth = 0; tps.liveTrusted = false;
             }
-          })();
-          // EOF/message_stop 后做一次最终均值收尾；没有 output_tokens 时保留
-          // estimated:true，界面不会误标成接口精确值。
-          emitTps(true, true);
+            if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
+            // 实时 token 数：端点在 delta 上带了累计 usage.output_tokens 就直接用。
+            // message_start 里那个 0/1 是 Anthropic 协议的占位值，不算；逐 delta
+            // 的值要亲眼见过它递增一次才采信（防某个端点每个 delta 都回同一个
+            // 占位数）；message_delta 回的按协议就是这一轮的完整输出量
+            if (j.type !== 'message_start' && j.usage && Number(j.usage.output_tokens) > 0) {
+              var uOut = Number(j.usage.output_tokens);
+              if (j.type === 'message_delta' || (uOut > tps.liveAuth && tps.liveAuth > 0)) tps.liveTrusted = true;
+              if (uOut > tps.liveAuth) tps.liveAuth = uOut;
+            }
+            if (j.type === 'content_block_start') {
+              var cb = j.content_block || {};
+              var b = { type: cb.type, raw: cb, index: nextIdx() };
+              blocks.push(b); partial[b.index] = '';
+              if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+              }
+            } else if (j.type === 'content_block_delta') {
+              var d = j.delta || {};
+              var blk = blocks[blocks.length - 1];
+              if (!blk) return;
+              // 工具入参的 JSON 也是模型逐字吐出来的输出，要计入 token。以前不计，
+              // 纯工具轮的实时值只有真实值的一个零头（实测估 10、接口回 113）
+              if (d.type === 'input_json_delta') {
+                var pj = d.partial_json || '';
+                partial[blk.index] += pj;
+                tps.liveTokens += Utils.estimateTokens(pj);
+                return;
+              }
+              if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
+                if (blk.type === 'tool_use') return;
+                if (d.type === 'text_delta') tps.liveTokens += Utils.estimateTokens(d.text || '');
+                else if (d.type === 'thinking_delta') tps.liveTokens += Utils.estimateTokens(d.thinking || '');
+                push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+              }
+            } else if (j.type === 'content_block_stop') {
+              var b2 = blocks[blocks.length - 1];
+              if (b2) {
+                if (b2.type === 'tool_use') {
+                  try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+                }
+                push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+              }
+            } else if (j.type === 'message_delta') {
+              mergeUsage(j.usage);
+              if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+              tpsEmit();
+            }
+          }, ac.signal);
+          // 本轮结束：记进请求累计并立刻发一次。此时多半已拿到接口 usage 的精确
+          // output_tokens；没有则退回估算值并保留 estimated:true，界面不会误标成
+          // 接口精确值
+          tpsCloseRound();
+          tpsEmit(true);
           addUsage(roundUsage);
           var toolUses = blocks.filter(function (b) { return b.type === 'tool_use'; });
           if (roundStop !== 'tool_use' || !toolUses.length) { stopReason = roundStop; break; }
@@ -2268,9 +2325,9 @@ var DemoBridge = {
         }
         push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
         push(self.sseEvent('message_stop', { type: 'message_stop' }));
-        DCP.emit('tps:idle', eventMeta());
+        tpsIdle();
       } catch (e) {
-        DCP.emit('tps:idle', eventMeta());
+        tpsIdle();
         if (e && e.name === 'AbortError') { finish(); endRequest(); return; }
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
@@ -2279,7 +2336,7 @@ var DemoBridge = {
     })().catch(function (e) {
       // title leg 初始化、ReadableStream 构造等主 try 之前的异常也必须收口，
       // 否则页面会一直停在“停止生成”，既看不到 error 也不关流。
-      DCP.emit('tps:idle', eventMeta());
+      tpsIdle();
       if (!(e && e.name === 'AbortError')) {
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
@@ -2611,6 +2668,7 @@ var CtxRing = {
             self.inject();
             self.update(self._data || self.emptyData());
             bindPrecise();          // 新链可能变了——重新绑
+            DCP.emit('toolbar:rebuild');   // 同一条工具条上的速率读数跟着在同一帧补回
           });
           mo.observe(host, { childList: true });
           self._barMos.push(mo);
@@ -2629,6 +2687,7 @@ var CtxRing = {
           self.inject();
           self.update(self._data || self.emptyData());
           bindPrecise();
+          DCP.emit('toolbar:rebuild');
         });
         moTop.observe(top, { childList: true, subtree: true });
         self._barMos.push(moTop);
@@ -2673,6 +2732,7 @@ var CtxRing = {
           if (!self.hasSessionDom() && self._sessionId) self.resetForNewChat();
           else self.update(!self.hasSessionDom() ? self.emptyData() : (self._data || self.emptyData()));
           bindPrecise();
+          DCP.emit('toolbar:rebuild');
         }
         // 消息数下降通常是切会话；点击监听覆盖“两条会话消息数相同”的情况。
         self.syncSession(!self._sessionId && !!(SEL.msg && document.querySelector(SEL.msg)));
@@ -2700,6 +2760,9 @@ var CtxRing = {
           if (!sameActive && !isNewChat) {
             var tracker = DCP.modules && DCP.modules.demoSearch;
             if (tracker && typeof tracker.invalidateRequests === 'function') tracker.invalidateRequests();
+            // 新会话 id 要等异步解析才有，这期间屏上已经是别的会话了——先通知
+            // 速率读数清空，别继续顶着旧会话的数字
+            DCP.emit('session:leave');
           }
           setTimeout(function () { self.syncSession(true); }, 0);
         }
@@ -2714,11 +2777,33 @@ DCP.modules.ctxRing = CtxRing;
 /* ============================================================
  * modules/tpsmeter：自定义模型实时输出速率（thinking + 正文）
  *
- * demobridge 每轮请求按 message_start → message_delta 计算平均
- * token/秒，并通过 tps:start / tps:update / tps:idle 广播。本模块只在
- * 输入工具条上下文环左侧显示纯文本速率；默认关闭，可在高级选项开启。
+ * demobridge 按「整个请求」累计输出 token 与生成用时（多轮工具循环不每轮
+ * 清零），并通过 tps:start / tps:update / tps:idle 广播。本模块只在输入
+ * 工具条上下文环左侧显示纯文本速率；默认关闭，可在高级选项开启。
+ *
+ * 读数要稳——2026-11-24 实测出三处闪烁，都在这里修：
+ *  - 工具条被官方整块重建（切会话/新对话首条消息）后读数跟着消失，只能等
+ *    body 上的节流兜底才回来（晚 1~7 帧）；占用环有绑在祖先链上的精确
+ *    观察器、同一帧就回来。现在读数跟着占用环的补注一起回来。
+ *  - 补回来/切会话时先顶着上一个会话的数字，等会话 id 解析完才换。现在值
+ *    只认「当前会话」：离开一刻就清空，不串会话。
+ *  - 新对话首条消息：会话 id 在请求进行中才解析出来，session:change 把读数
+ *    从「实时」打回空闲态，首 token 一到又跳回「实时」。现在同一个请求仍在
+ *    途时保持「实时」。
  * ============================================================ */
 var TpsMeter = {
+  /* ---------- 状态 ----------
+   * _live：在途请求的实时读数；_last：当前会话上一轮的最终读数（空闲时显示
+   * 「平均」）。两者必须分开：以前只有一个 _last，新一轮请求刚开始、首个
+   * tps:update 还没来时，上一轮的「平均」会顶着「实时」的标签留在屏上
+   * （等首 token 的那一秒多，实测） */
+  _last: null,
+  _live: null,
+  _final: null,    // 本次请求收尾时未经平滑的最终值（落库用）
+  _active: false,
+  _reqId: '',      // 正在显示的那个请求（idle 只认它，别的请求的收尾事件不碰读数）
+  _sid: null,      // 读数当前归属的会话
+
   inject: function () {
     var bar = (DCP.modules.toolbar && DCP.modules.toolbar.find) ? DCP.modules.toolbar.find() : null;
     if (!bar || document.getElementById('dcp-tps-meter')) return;
@@ -2758,52 +2843,91 @@ var TpsMeter = {
     return n.toFixed(2);
   },
 
+  // 当前会话 id 以占用环为准——会话身份是 ctxRing 负责解析的
+  currentSid: function () {
+    var R = DCP.modules && DCP.modules.ctxRing;
+    return (R && R._sessionId) || null;
+  },
+
+  savedFor: function (sid) {
+    var s = sid && DCP.config.sessions()[sid];
+    return (s && s.tps && typeof s.tps.tps === 'number' && s.tps.tps > 0) ? s.tps : null;
+  },
+
+  // 事件属于不在当前会话纪元里的请求（用户已切走）→ 整条丢弃
+  isCurrent: function (payload) {
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    return !(payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+      !tracker.isRequestCurrent(payload));
+  },
+
   render: function () {
     var el = document.getElementById('dcp-tps-meter') || this.inject();
     if (!el) return;
-    if (this._active) {
-      el.textContent = this._last
-        ? DCP.t('实时 {n} tok/s', { n: this.fmt(this._last.tps) })
-        : DCP.t('实时 -- tok/s');
-    } else {
-      el.textContent = this._last
-        ? DCP.t('平均 {n} tok/s', { n: this.fmt(this._last.tps) })
-        : DCP.t('-- tok/s');
-    }
-    if (this._last) {
+    var d = this._active ? this._live : this._last;
+    el.textContent = d
+      ? DCP.t(this._active ? '实时 {n} tok/s' : '平均 {n} tok/s', { n: this.fmt(d.tps) })
+      : DCP.t(this._active ? '实时 -- tok/s' : '-- tok/s');
+    if (d) {
       el.title = DCP.t('本轮已输出 {tokens} tokens，用时 {sec} 秒（{kind}）', {
-        tokens: Math.round(this._last.tokens || 0),
-        sec: (Number(this._last.elapsed) || 0).toFixed(2),
-        kind: this._last.estimated ? DCP.t('实时估算') : DCP.t('接口 usage 精确值')
+        tokens: Math.round(d.tokens || 0),
+        sec: (Number(d.elapsed) || 0).toFixed(2),
+        kind: d.estimated ? DCP.t('实时估算') : DCP.t('接口 usage 精确值')
       });
     } else {
       el.title = '';
     }
     el.style.display = this.canShow() ? 'inline-flex' : 'none';
+    this.stabilize(el);
+  },
+
+  // 读数宽度固定：数字在 99.9 ↔ 100 之间变化时位数会变，宽度跟着变会让它
+  // 左右抖一下。按最宽的写法量一次最小宽度（等宽数字，其余状态右侧对齐）
+  stabilize: function (el) {
+    if (this._minW && this._minLang === DCP.i18n.lang()) {
+      el.style.minWidth = this._minW + 'px';
+      return;
+    }
+    if (el.style.display === 'none') return;
+    var keep = el.textContent, w = 0;
+    ['实时', '平均'].forEach(function (label) {
+      ['88.88', '888'].forEach(function (n) {
+        el.textContent = DCP.t(label + ' {n} tok/s', { n: n });
+        w = Math.max(w, el.getBoundingClientRect().width);
+      });
+    });
+    el.textContent = keep;
+    this._minW = Math.ceil(w);
+    this._minLang = DCP.i18n.lang();
+    el.style.minWidth = this._minW + 'px';
   },
 
   start: function (payload) {
-    var tracker = DCP.modules && DCP.modules.demoSearch;
-    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
-        !tracker.isRequestCurrent(payload)) return;
+    if (!this.isCurrent(payload)) return;
+    this._reqId = payload.requestId || '';
+    this._live = null;      // 上一轮的「平均」不能顶着「实时」的标签留在屏上
+    this._final = null;
     this._active = true;
     this.render();
   },
 
   paint: function (data, payload) {
-    var tracker = DCP.modules && DCP.modules.demoSearch;
-    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
-        !tracker.isRequestCurrent(payload)) return;
-    if (data && data.tps > 0) this._last = data;
+    if (!this.isCurrent(payload)) return;
+    if (payload && payload.requestId) this._reqId = payload.requestId;
+    if (data && data.tps > 0) this._live = data;
     this._active = true;
     this.render();
   },
 
   idle: function (payload) {
-    var tracker = DCP.modules && DCP.modules.demoSearch;
-    if (payload && payload.requestId && tracker && typeof tracker.isRequestCurrent === 'function' &&
-        !tracker.isRequestCurrent(payload)) return;
+    if (!this.isCurrent(payload)) return;
+    if (this._reqId && payload && payload.requestId && this._reqId !== payload.requestId) return;
     this._active = false;
+    this._reqId = '';
+    // 最终读数归发起它的那个会话；用户已经切走时只落库、不上屏
+    var sameSession = !(payload && payload.sessionId && this._sid && payload.sessionId !== this._sid);
+    if (sameSession && this._live && this._live.tps > 0) this._last = this._live;
+    this._live = null;
     this.render();
     // 只在请求收尾时持久化一次权威/最终均值，避免 250ms 实时更新把整个
     // 会话表反复序列化并同步写 GM_setValue。
@@ -2811,41 +2935,67 @@ var TpsMeter = {
   },
 
   saveLast: function (sid) {
-    if (!this._last) return;
-    sid = sid || (DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId);
+    // 落库的是未经平滑的最终值（tps:update 带 final 的那一条）
+    var data = this._final;
+    if (!data) return;
+    sid = sid || this._sid || (DCP.modules.ctxRing && DCP.modules.ctxRing._sessionId);
     if (!sid) return;
     var all = DCP.config.sessions();
-    all[sid] = Object.assign({}, all[sid], { tps: this._last, savedAt: Date.now() });
+    all[sid] = Object.assign({}, all[sid], { tps: data, savedAt: Date.now() });
     DCP.config.saveSessions();
   },
 
+  // 切到某个会话（含新对话的会话 id 在请求进行中才解析出来）：读数换成该
+  // 会话上一轮的最终值。后一种不是用户切会话——同一个请求仍在途时保持
+  // 「实时」，否则首 token 到来前读数会先掉回空闲态再跳回来
   restore: function (sid) {
-    var saved = sid && DCP.config.sessions()[sid];
-    this._last = saved && saved.tps ? saved.tps : null;
-    this._active = false;
+    this._sid = sid || null;
+    this._last = this.savedFor(this._sid);
+    var tracker = DCP.modules && DCP.modules.demoSearch;
+    var inFlight = !!(this._reqId && tracker && typeof tracker.isRequestCurrent === 'function' &&
+      tracker.isRequestCurrent({ requestId: this._reqId, sessionId: this._sid }));
+    if (!inFlight) {
+      this._active = false;
+      this._live = null;
+      this._reqId = '';
+    }
     this.render();
+  },
+
+  // 工具条被官方整块重建后读数跟着没了。占用环有精确观察器、同一帧补回；
+  // 这里由 ctxRing 补完占用环后发 toolbar:rebuild 带动，一起在同一帧回来，
+  // 并直接按当前会话取值（不先闪出上一个会话的数字）
+  reattach: function () {
+    if (document.getElementById('dcp-tps-meter')) return;
+    this.inject();
+    this.restore(this._sid);
   },
 
   init: function () {
     var self = this;
     Utils.onReady(function () {
       self.inject();
-      self.render();
+      self.restore(self.currentSid());
       DCP.on('tps:start', function (p) { self.start(p); });
-      DCP.on('tps:update', function (p) { if (p) self.paint(p, p); });
+      DCP.on('tps:update', function (p) {
+        // 收尾那条是未经平滑的精确值，单独留着落库
+        if (p && p.final && self.isCurrent(p)) self._final = p;
+        self.paint(p, p);
+      });
       DCP.on('tps:idle', function (p) { self.idle(p); });
       DCP.on('session:change', function (e) { self.restore(e && e.sessionId); });
+      // 点了别的会话：屏上马上要换人，读数先清空，别继续顶着旧会话的数字
+      DCP.on('session:leave', function () { self.restore(null); });
+      DCP.on('toolbar:rebuild', function () { self.reattach(); });
       DCP.on('cfg:change', function (e) {
         if (e.path === 'demoCustom' || e.path === 'demoEndpoint' || e.path === 'demoBridge' || e.path === 'demoShowTps') {
           self.render();
         }
       });
-      // 工具条会随会话切换重建；与上下文环相同，掉了就补回来。
+      // 工具条会随会话切换重建；与上下文环相同，掉了就补回来（兜底：
+      // 占位环自己没注上时 ctxRing 的精确观察器没绑，只能走这条节流路径）
       new MutationObserver(Utils.throttle(function () {
-        if (!document.getElementById('dcp-tps-meter')) {
-          self.inject();
-          self.render();
-        }
+        self.reattach();
       }, 100)).observe(document.body, { childList: true, subtree: true });
     });
   }

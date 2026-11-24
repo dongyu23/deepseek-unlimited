@@ -633,6 +633,72 @@ var DemoBridge = {
       if (search && typeof search.finishRequest === 'function' && requestCtx) search.finishRequest(requestCtx.requestId);
     };
 
+    /* ---------- 实时速率（按整个请求累计） ----------
+     * 以前每轮从头重算，多轮工具循环里数字先跳高再往下走、每换一轮重来一遍；
+     * 实时值又是按字数估的，轮末拿到接口 usage 才换成精确值，两个口径对不上，
+     * 收尾时猛跳一下（实测 196 → 108）。现在：
+     *  - 按整个请求累计：已结束的轮用接口 usage 的精确 output_tokens，在途的
+     *    这一轮优先也用精确值——StepFun 这类端点每个 delta 上都带累计
+     *    usage.output_tokens（2026-11-24 抓原始流确认）；端点不带才退回按字数
+     *    估算。两者加总除以累计生成用时（不含工具腿等待）；
+     *  - 显示值向目标值指数逼近（时间常数 0.45s）：目标缓变时基本跟手，遇到
+     *    估算值被精确值替换这类阶跃则平滑过渡；
+     *  - 计时器按请求走，工具腿等待期间也继续发，显示值才能走完这段过渡。 */
+    var tps = {
+      authTokens: 0,      // 已结束各轮的输出 token 之和
+      authExact: true,    // 上述是否全部来自接口 usage
+      genTime: 0,         // 已结束各轮的生成用时之和（秒）
+      liveTokens: 0,      // 在途这一轮按字数估的 token
+      liveAuth: 0,        // 在途这一轮接口回的累计 output_tokens
+      liveTrusted: false, // liveAuth 可否当精确值用（见 pump 回调里的采信规则）
+      roundStart: 0,      // 在途这一轮的起点；0 = 当前不在生成中
+      shown: 0, hasShown: false, lastTick: 0, lastEmit: 0, timer: null
+    };
+    // 在途这一轮的精确输出量：接口给了就用，没给返回 0（调用方退回估算值）
+    var tpsLiveExact = function () { return tps.liveTrusted ? tps.liveAuth : 0; };
+    var tpsTarget = function () {
+      var exact = tpsLiveExact();
+      var live = exact > 0 ? exact : tps.liveTokens;
+      var elapsed = tps.genTime + (tps.roundStart ? (performance.now() - tps.roundStart) / 1000 : 0);
+      var tokens = tps.authTokens + live;
+      if (!(elapsed > 0) || !(tokens > 0)) return null;
+      return {
+        tps: tokens / elapsed, tokens: tokens, elapsed: elapsed,
+        // 工具腿等待期间没有在途轮：已结束各轮全是精确值，这个数就是精确的
+        estimated: !(tps.authExact && (!tps.roundStart || exact > 0))
+      };
+    };
+    var tpsEmit = function (force) {
+      var t = tpsTarget();
+      if (!t) return;
+      var now = performance.now();
+      if (!tps.hasShown) { tps.shown = t.tps; tps.hasShown = true; }
+      else if (now > tps.lastTick) {
+        tps.shown += (t.tps - tps.shown) * (1 - Math.exp(-(now - tps.lastTick) / 450));
+      }
+      tps.lastTick = now;
+      if (!force && now - tps.lastEmit < 200) return;
+      tps.lastEmit = now;
+      // tps 是平滑后的显示值；tokens / elapsed 是真实累计量（浮层提示用）
+      DCP.emit('tps:update', eventMeta({ tps: tps.shown, tokens: t.tokens, elapsed: t.elapsed, estimated: t.estimated }));
+    };
+    // 一轮结束：记进请求累计。接口没给 usage 的轮退回估算值，并把精确标记摘掉
+    var tpsCloseRound = function () {
+      var exact = tpsLiveExact();
+      if (exact > 0) tps.authTokens += exact;
+      else if (tps.liveTokens > 0) { tps.authTokens += tps.liveTokens; tps.authExact = false; }
+      tps.genTime += tps.roundStart ? (performance.now() - tps.roundStart) / 1000 : 0;
+      tps.roundStart = 0; tps.liveTokens = 0; tps.liveAuth = 0; tps.liveTrusted = false;
+    };
+    // 请求收尾：停计时器，把未经平滑的最终值发出去（「平均」要的是精确值），
+    // 再通知空闲
+    var tpsIdle = function () {
+      if (tps.timer) { clearInterval(tps.timer); tps.timer = null; }
+      var t = tpsTarget();
+      if (t) DCP.emit('tps:update', eventMeta({ tps: t.tps, tokens: t.tokens, elapsed: t.elapsed, estimated: t.estimated, final: true }));
+      DCP.emit('tps:idle', eventMeta());
+    };
+
     // 官方 demo 会把工具块从下一次 API 请求里过滤掉，但它自己的 IndexedDB
     // 仍完整保存着这些块。只从请求发起时唯一确定的当前会话恢复中断轮，
     // 不另建存储、不截断内容，也不扫描其它会话。
@@ -780,35 +846,15 @@ var DemoBridge = {
               }, {})
             });
             push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
-            DCP.emit('tps:idle', eventMeta());
+            tpsIdle();
             endRequest();
             finish(); return;
           }
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
           var roundUsage = null, roundStop = 'end_turn', respModel = '';
-          var tpsStart = 0, tpsLiveTokens = 0, tpsLastEmit = 0, tpsTimer = null;
-          var emitTps = function (authoritative, force) {
-            if (!tpsStart) return;
-            var elapsed = (performance.now() - tpsStart) / 1000;
-            if (!(elapsed > 0)) return;
-            // 只有端点确实回了有效 output_tokens 才算精确；否则即使调用方
-            // 请求“权威收尾”，也必须明确标记为本地估算，不能把估算值冒充
-            // 接口 usage 精确值。
-            var hasAuthoritative = !!(authoritative && roundUsage && Number(roundUsage.output_tokens) > 0);
-            var tokens = hasAuthoritative ? Number(roundUsage.output_tokens) : tpsLiveTokens;
-            if (!(tokens > 0)) return;
-            var now = performance.now();
-            if (!force && now - tpsLastEmit < 200) return;
-            tpsLastEmit = now;
-            DCP.emit('tps:update', eventMeta({
-              tps: tokens / elapsed,
-              tokens: tokens,
-              elapsed: elapsed,
-              estimated: !hasAuthoritative
-            }));
-          };
-          tpsTimer = setInterval(function () { emitTps(false, false); }, 250);
+          // 速率计时器按请求走（见 intercept 开头 tps 注释）：首轮起一次，收尾 tpsIdle() 清
+          if (!tps.timer) tps.timer = setInterval(function () { tpsEmit(); }, 250);
           // usage 合并：Anthropic 系把 input 类放在 message_start.message.usage、
           // output 放在 message_delta.usage，很多第三方端点只给其中一个——
           // 以前只读 message_delta，遇到「只在 message_start 给 input_tokens」
@@ -820,55 +866,66 @@ var DemoBridge = {
               if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
             });
           };
-          await (async function () {
-            try {
-              await self.pump(resp.body, function (j) {
-                if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
-                if (j.type === 'message_start') {
-                  tpsStart = performance.now();
-                  tpsLiveTokens = 0;
-                  tpsLastEmit = 0;
-                }
-                if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
-                if (j.type === 'content_block_start') {
-                  var cb = j.content_block || {};
-                  var b = { type: cb.type, raw: cb, index: nextIdx() };
-                  blocks.push(b); partial[b.index] = '';
-                  if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
-                    push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
-                  }
-                } else if (j.type === 'content_block_delta') {
-                  var d = j.delta || {};
-                  var blk = blocks[blocks.length - 1];
-                  if (!blk) return;
-                  if (d.type === 'input_json_delta') { partial[blk.index] += d.partial_json || ''; return; }
-                  if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
-                    if (blk.type === 'tool_use') return;
-                    if (d.type === 'text_delta') tpsLiveTokens += Utils.estimateTokens(d.text || '');
-                    else if (d.type === 'thinking_delta') tpsLiveTokens += Utils.estimateTokens(d.thinking || '');
-                    push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
-                  }
-                } else if (j.type === 'content_block_stop') {
-                  var b2 = blocks[blocks.length - 1];
-                  if (b2) {
-                    if (b2.type === 'tool_use') {
-                      try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
-                    }
-                    push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
-                  }
-                } else if (j.type === 'message_delta') {
-                  mergeUsage(j.usage);
-                  if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
-                  if (blocks.some(function (b) { return b.type === 'thinking' || b.type === 'text'; })) emitTps(true, false);
-                }
-              }, ac.signal);
-            } finally {
-              if (tpsTimer) { clearInterval(tpsTimer); tpsTimer = null; }
+          await self.pump(resp.body, function (j) {
+            if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
+            if (j.type === 'message_start') {
+              tps.roundStart = performance.now();
+              tps.liveTokens = 0; tps.liveAuth = 0; tps.liveTrusted = false;
             }
-          })();
-          // EOF/message_stop 后做一次最终均值收尾；没有 output_tokens 时保留
-          // estimated:true，界面不会误标成接口精确值。
-          emitTps(true, true);
+            if (j.type === 'message_start' && j.message) mergeUsage(j.message.usage);
+            // 实时 token 数：端点在 delta 上带了累计 usage.output_tokens 就直接用。
+            // message_start 里那个 0/1 是 Anthropic 协议的占位值，不算；逐 delta
+            // 的值要亲眼见过它递增一次才采信（防某个端点每个 delta 都回同一个
+            // 占位数）；message_delta 回的按协议就是这一轮的完整输出量
+            if (j.type !== 'message_start' && j.usage && Number(j.usage.output_tokens) > 0) {
+              var uOut = Number(j.usage.output_tokens);
+              if (j.type === 'message_delta' || (uOut > tps.liveAuth && tps.liveAuth > 0)) tps.liveTrusted = true;
+              if (uOut > tps.liveAuth) tps.liveAuth = uOut;
+            }
+            if (j.type === 'content_block_start') {
+              var cb = j.content_block || {};
+              var b = { type: cb.type, raw: cb, index: nextIdx() };
+              blocks.push(b); partial[b.index] = '';
+              if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
+              }
+            } else if (j.type === 'content_block_delta') {
+              var d = j.delta || {};
+              var blk = blocks[blocks.length - 1];
+              if (!blk) return;
+              // 工具入参的 JSON 也是模型逐字吐出来的输出，要计入 token。以前不计，
+              // 纯工具轮的实时值只有真实值的一个零头（实测估 10、接口回 113）
+              if (d.type === 'input_json_delta') {
+                var pj = d.partial_json || '';
+                partial[blk.index] += pj;
+                tps.liveTokens += Utils.estimateTokens(pj);
+                return;
+              }
+              if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
+                if (blk.type === 'tool_use') return;
+                if (d.type === 'text_delta') tps.liveTokens += Utils.estimateTokens(d.text || '');
+                else if (d.type === 'thinking_delta') tps.liveTokens += Utils.estimateTokens(d.thinking || '');
+                push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
+              }
+            } else if (j.type === 'content_block_stop') {
+              var b2 = blocks[blocks.length - 1];
+              if (b2) {
+                if (b2.type === 'tool_use') {
+                  try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
+                }
+                push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
+              }
+            } else if (j.type === 'message_delta') {
+              mergeUsage(j.usage);
+              if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
+              tpsEmit();
+            }
+          }, ac.signal);
+          // 本轮结束：记进请求累计并立刻发一次。此时多半已拿到接口 usage 的精确
+          // output_tokens；没有则退回估算值并保留 estimated:true，界面不会误标成
+          // 接口精确值
+          tpsCloseRound();
+          tpsEmit(true);
           addUsage(roundUsage);
           var toolUses = blocks.filter(function (b) { return b.type === 'tool_use'; });
           if (roundStop !== 'tool_use' || !toolUses.length) { stopReason = roundStop; break; }
@@ -930,9 +987,9 @@ var DemoBridge = {
         }
         push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
         push(self.sseEvent('message_stop', { type: 'message_stop' }));
-        DCP.emit('tps:idle', eventMeta());
+        tpsIdle();
       } catch (e) {
-        DCP.emit('tps:idle', eventMeta());
+        tpsIdle();
         if (e && e.name === 'AbortError') { finish(); endRequest(); return; }
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
@@ -941,7 +998,7 @@ var DemoBridge = {
     })().catch(function (e) {
       // title leg 初始化、ReadableStream 构造等主 try 之前的异常也必须收口，
       // 否则页面会一直停在“停止生成”，既看不到 error 也不关流。
-      DCP.emit('tps:idle', eventMeta());
+      tpsIdle();
       if (!(e && e.name === 'AbortError')) {
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
