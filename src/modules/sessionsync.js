@@ -126,7 +126,7 @@ var SessionSync = {
     if (msg.type === 'presence' || msg.type === 'heartbeat') {
       this.mergeGenerating(msg.generating || [], msg.tabId, msg.at);
       (msg.done || []).forEach(function (sid) {
-        if (sid) self._done[sid] = self._done[sid] || { at: msg.at };
+        if (sid && self.isBackground()) self._done[sid] = self._done[sid] || { at: msg.at };
       });
       this.renderRows();
       this.tryRestore();
@@ -213,7 +213,9 @@ var SessionSync = {
       if (prev && prev.sid && !sid) sid = prev.sid;
       delete this._generating[key];
       if (state === 'done' && sid) {
-        this._done[sid] = { at: p.at || Date.now(), title: p.title || (prev && prev.title) || '', updatedAt: p.updatedAt || 0 };
+        // 用户正在这个标签页上时不显示“未读”蓝点；只有后台标签才提示。
+        if (this.isBackground()) this._done[sid] = { at: p.at || Date.now(), title: p.title || (prev && prev.title) || '', updatedAt: p.updatedAt || 0 };
+        else delete this._done[sid];
       }
     }
     if (local) this.send({ type: 'activity', requestId: requestId, sessionId: sid, state: state, title: p.title || '', updatedAt: p.updatedAt || 0 });
@@ -433,7 +435,13 @@ var SessionSync = {
     };
     this._onPageHide = function () { self.bye(); };
     this._onInteraction = function () { self._lastInteractionAt = Date.now(); };
-    this._onFocus = function () { self._lastInteractionAt = Date.now(); };
+    this._onFocus = function () {
+      self._lastInteractionAt = Date.now();
+      self.clearForegroundDots();
+    };
+    this._onVisibility = function () {
+      if (document.visibilityState === 'visible') self.clearForegroundDots();
+    };
     this._onBlur = function () { self._seenBlur = true; };
     this._onResize = function () { self.repositionStatuses(); };
     document.addEventListener('click', this._onRowClick, true);
@@ -443,7 +451,15 @@ var SessionSync = {
     this.pageWin().addEventListener('focus', this._onFocus);
     this.pageWin().addEventListener('blur', this._onBlur);
     this.pageWin().addEventListener('resize', this._onResize);
+    document.addEventListener('visibilitychange', this._onVisibility);
     this.pageWin().addEventListener('pagehide', this._onPageHide);
+  },
+
+  clearForegroundDots: function () {
+    if (this.isBackground()) return;
+    var changed = false;
+    Object.keys(this._done).forEach(function (sid) { delete this._done[sid]; changed = true; }, this);
+    if (changed) this.renderRows();
   },
 
   markSeen: function (sid) {
@@ -686,6 +702,7 @@ var SessionSync = {
     if (this._onFocus) { try { this.pageWin().removeEventListener('focus', this._onFocus); } catch (e) {} this._onFocus = null; }
     if (this._onBlur) { try { this.pageWin().removeEventListener('blur', this._onBlur); } catch (e) {} this._onBlur = null; }
     if (this._onResize) { try { this.pageWin().removeEventListener('resize', this._onResize); } catch (e) {} this._onResize = null; }
+    if (this._onVisibility) { document.removeEventListener('visibilitychange', this._onVisibility); this._onVisibility = null; }
     if (this._onInteraction) {
       document.removeEventListener('pointerdown', this._onInteraction, true);
       document.removeEventListener('keydown', this._onInteraction, true);

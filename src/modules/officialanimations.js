@@ -13,11 +13,13 @@ var OfficialAnimations = {
   POP_MS: 100,
   EASE: 'cubic-bezier(0.4, 0, 0.2, 1)',
   POP_EASE: 'cubic-bezier(0.4, 0, 1, 1)',
+  EXPAND_CLASS: 'dcp-sidebar-expanding',
   _busy: false,
   _skip: false,
   _animating: false,
   _raf: 0,
   _observer: null,
+  _styleInjected: false,
 
   reduced: function () {
     try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; }
@@ -52,15 +54,29 @@ var OfficialAnimations = {
     }
   },
 
-  prepare: function (sider, width) {
+  injectStyle: function () {
+    if (this._styleInjected) return;
+    this._styleInjected = true;
+    // 官网以并发渲染插入侧栏时，先在样式层把它锁在 0 宽且不可见，避免
+    // 动画代码拿到节点前先绘制一帧完整侧栏（展开闪烁的根因）。
+    DCP.bridge.addStyle(
+      '.dcp-sidebar-expanding [class*="sider-"]{visibility:hidden!important;width:0!important;' +
+      'min-width:0!important;max-width:0!important;padding:0!important;border:0!important;flex:0 0 0!important}'
+    );
+  },
+
+  capture: function (sider) {
     var cs = getComputedStyle(sider);
-    var old = {
+    return {
       width: sider.style.width, minWidth: sider.style.minWidth, maxWidth: sider.style.maxWidth,
       flex: sider.style.flex, overflow: sider.style.overflow, boxSizing: sider.style.boxSizing,
       paddingLeft: sider.style.paddingLeft, paddingRight: sider.style.paddingRight,
       computedPaddingLeft: cs.paddingLeft, computedPaddingRight: cs.paddingRight,
       borderRightWidth: sider.style.borderRightWidth, computedBorderRightWidth: cs.borderRightWidth
     };
+  },
+
+  applyWidth: function (sider, width) {
     sider.style.flex = '0 0 auto';
     sider.style.overflow = 'hidden';
     sider.style.boxSizing = 'border-box';
@@ -72,7 +88,26 @@ var OfficialAnimations = {
       sider.style.paddingRight = '0px';
       sider.style.borderRightWidth = '0px';
     }
+  },
+
+  prepare: function (sider, width) {
+    var old = this.capture(sider);
+    this.applyWidth(sider, width);
     return old;
+  },
+
+  waitForSidebar: function () {
+    var sel = (DCP.SEL || {}).sidebarRoot || '[class*="sider-"]';
+    var now = document.querySelector(sel);
+    if (now) return Promise.resolve(now);
+    return new Promise(function (resolve) {
+      var mo = new MutationObserver(function () {
+        var el = document.querySelector(sel);
+        if (el) { mo.disconnect(); clearTimeout(timer); resolve(el); }
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+      var timer = setTimeout(function () { mo.disconnect(); resolve(null); }, 900);
+    });
   },
 
   restore: function (sider, old) {
@@ -154,27 +189,43 @@ var OfficialAnimations = {
   },
 
   expand: async function (btn) {
-    // 先让官网生成完整侧栏，再在同一帧置 0 宽并展开，避免先出现完整宽度。
-    this.nativeClick(btn);
-    var sider = await Utils.waitFor(function () {
-      return document.querySelector((DCP.SEL || {}).sidebarRoot || '[class*="sider-"]');
-    }, 900, 30);
-    if (!sider || typeof sider.animate !== 'function') return;
-    var to = sider.getBoundingClientRect().width || 261;
-    var duration = this.reduced() ? 1 : this.SIDEBAR_MS;
-    var old = this.prepare(sider, 0);
-    void sider.offsetWidth;
-    var anim = sider.animate([
-      { width: '0px', minWidth: '0px', maxWidth: '0px', paddingLeft: '0px', paddingRight: '0px', borderRightWidth: '0px' },
-      { width: to + 'px', minWidth: to + 'px', maxWidth: to + 'px', paddingLeft: old.computedPaddingLeft, paddingRight: old.computedPaddingRight, borderRightWidth: old.computedBorderRightWidth }
-    ], { duration: duration, easing: this.EASE, fill: 'forwards' });
-    var fades = this.fadeContent(sider, 0, 1, duration);
-    this.startGeometry();
-    try { await anim.finished; } catch (e) {}
-    this.restore(sider, old);
-    try { anim.cancel(); } catch (e) {}
-    fades.forEach(function (a) { try { a.cancel(); } catch (e) {} });
-    this.stopGeometry();
+    this.injectStyle();
+    var root = document.documentElement;
+    var sider = null, old = null, anim = null, fades = [], started = false;
+    // 点击前就锁住新节点：React 插入时不允许它先以完整宽度参与布局。
+    root.classList.add(this.EXPAND_CLASS);
+    try {
+      this.nativeClick(btn);
+      sider = await this.waitForSidebar();
+      if (!sider || typeof sider.animate !== 'function') return;
+
+      // 同一 JS 任务内临时解锁一次，只为量到真实目标宽度和原始盒模型；
+      // 随后立即重新锁住并置 0，浏览器没有机会绘制中间态。
+      root.classList.remove(this.EXPAND_CLASS);
+      var to = sider.getBoundingClientRect().width || 261;
+      old = this.capture(sider);
+      root.classList.add(this.EXPAND_CLASS);
+      this.applyWidth(sider, 0);
+      void sider.offsetWidth;
+      root.classList.remove(this.EXPAND_CLASS);
+
+      var duration = this.reduced() ? 1 : this.SIDEBAR_MS;
+      anim = sider.animate([
+        { width: '0px', minWidth: '0px', maxWidth: '0px', paddingLeft: '0px', paddingRight: '0px', borderRightWidth: '0px' },
+        { width: to + 'px', minWidth: to + 'px', maxWidth: to + 'px', paddingLeft: old.computedPaddingLeft, paddingRight: old.computedPaddingRight, borderRightWidth: old.computedBorderRightWidth }
+      ], { duration: duration, easing: this.EASE, fill: 'forwards' });
+      started = true;
+      fades = this.fadeContent(sider, 0, 1, duration);
+      this.startGeometry();
+      try { await anim.finished; } catch (e) {}
+      this.restore(sider, old);
+      try { anim.cancel(); } catch (e) {}
+      fades.forEach(function (a) { try { a.cancel(); } catch (e) {} });
+      this.stopGeometry();
+    } finally {
+      root.classList.remove(this.EXPAND_CLASS);
+      if (!started && sider && old && sider.isConnected) this.restore(sider, old);
+    }
   },
 
   pop: function (node) {
