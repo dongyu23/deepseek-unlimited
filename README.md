@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.17-4D6BFE" alt="version 1.0.17">
+  <img src="https://img.shields.io/badge/version-1.0.18-4D6BFE" alt="version 1.0.18">
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="license MIT">
   <img src="https://img.shields.io/github/stars/dongyu23/deepseek-unlimited?style=flat&color=4D6BFE" alt="GitHub stars">
   <img src="https://img.shields.io/badge/Tampermonkey-4.x%2B-f59e0b" alt="Tampermonkey 4.x+">

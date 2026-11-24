@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.17
+// @version      1.0.18
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -108,7 +108,7 @@ function pageWindow() {
  * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
  * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
 var DCP = {
-  version: '1.0.17',
+  version: '1.0.18',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -4382,7 +4382,7 @@ var SessionSync = {
     if (this._styleInjected) return;
     this._styleInjected = true;
     DCP.bridge.addStyle(
-      '.dcp-session-status{flex:0 0 12px;width:12px;height:16px;margin:0 2px 0 6px;display:none;' +
+      '.dcp-session-status{position:absolute;top:50%;transform:translateY(-50%);flex:0 0 12px;width:12px;height:16px;margin:0;display:none;' +
       'align-items:center;justify-content:center;pointer-events:none;color:var(--dcp-accent,#3b6cf6)}' +
       '.dcp-session-status[data-state="generating"],.dcp-session-status[data-state="done"]{display:inline-flex}' +
       '.dcp-session-status::before{content:"";display:block;box-sizing:border-box}' +
@@ -4408,6 +4408,40 @@ var SessionSync = {
         self.renderRows(entries);
       }, function () {});
     }, 80);
+  },
+
+  // 状态点紧贴标题文字右侧，而不是被 flex:1 的标题容器推到最右边。
+  // 标题过长时限制在操作按钮左侧，避免和“更多”按钮重叠。
+  placeStatus: function (row, el) {
+    if (!row || !el) return;
+    var title = row.querySelector('.title-ff6fc9') || row.querySelector('.dcp-pinned-title');
+    if (!title) { el.style.left = ''; return; }
+    var rr = row.getBoundingClientRect();
+    var tr = title.getBoundingClientRect();
+    var textRight = tr.right;
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(title);
+      var rects = range.getClientRects();
+      if (rects.length) textRight = rects[rects.length - 1].right;
+      else textRight = range.getBoundingClientRect().right || textRight;
+    } catch (e) {}
+    textRight = Math.min(textRight || tr.right, tr.right);
+    var left = textRight - rr.left + 6;
+    var action = row.querySelector('[class*="action-"]') || row.querySelector('.dcp-pinned-unpin');
+    if (action) {
+      var ar = action.getBoundingClientRect();
+      if (ar.width > 0) left = Math.min(left, ar.left - rr.left - 18);
+    }
+    el.style.left = Math.max(0, left) + 'px';
+  },
+
+  repositionStatuses: function () {
+    var nodes = document.querySelectorAll('.dcp-session-status');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      this.placeStatus(el.closest('.item-ff6fc9, .dcp-pinned-row'), el);
+    }
   },
 
   renderRows: function (entries) {
@@ -4437,6 +4471,7 @@ var SessionSync = {
         el.title = DCP.t(state === 'generating' ? '正在生成' : '生成完毕');
         el.setAttribute('aria-label', el.title);
       }
+      self.placeStatus(row, el);
     });
   },
 
@@ -4456,12 +4491,14 @@ var SessionSync = {
     this._onInteraction = function () { self._lastInteractionAt = Date.now(); };
     this._onFocus = function () { self._lastInteractionAt = Date.now(); };
     this._onBlur = function () { self._seenBlur = true; };
+    this._onResize = function () { self.repositionStatuses(); };
     document.addEventListener('click', this._onRowClick, true);
     document.addEventListener('pointerdown', this._onInteraction, true);
     document.addEventListener('keydown', this._onInteraction, true);
     document.addEventListener('input', this._onInteraction, true);
     this.pageWin().addEventListener('focus', this._onFocus);
     this.pageWin().addEventListener('blur', this._onBlur);
+    this.pageWin().addEventListener('resize', this._onResize);
     this.pageWin().addEventListener('pagehide', this._onPageHide);
   },
 
@@ -4704,6 +4741,7 @@ var SessionSync = {
     if (this._onPageHide) { try { this.pageWin().removeEventListener('pagehide', this._onPageHide); } catch (e) {} this._onPageHide = null; }
     if (this._onFocus) { try { this.pageWin().removeEventListener('focus', this._onFocus); } catch (e) {} this._onFocus = null; }
     if (this._onBlur) { try { this.pageWin().removeEventListener('blur', this._onBlur); } catch (e) {} this._onBlur = null; }
+    if (this._onResize) { try { this.pageWin().removeEventListener('resize', this._onResize); } catch (e) {} this._onResize = null; }
     if (this._onInteraction) {
       document.removeEventListener('pointerdown', this._onInteraction, true);
       document.removeEventListener('keydown', this._onInteraction, true);
@@ -4968,7 +5006,7 @@ var SessionPin = {
       DCP.bridge.addStyle(
         '.dcp-pinned-section{position:fixed;z-index:80;display:none;box-sizing:border-box;max-height:35vh;overflow:auto;' +
         'border-bottom:1px solid rgba(127,127,127,.18);box-shadow:0 8px 20px rgba(0,0,0,.12)}' +
-        '.dcp-pinned-row{display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 6px 8px 10px;cursor:pointer;' +
+        '.dcp-pinned-row{position:relative;display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 6px 8px 10px;cursor:pointer;' +
         'font-size:14px;line-height:20px;color:inherit;border-radius:8px}' +
         '.dcp-pinned-row:hover{background:rgba(127,127,127,.12)}' +
         '.dcp-pinned-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
@@ -5009,6 +5047,8 @@ var SessionPin = {
     this._section.style.background = bg || '#fff';
     this._section.style.color = getComputedStyle(sider || wrap).color;
     wrap.style.paddingTop = (this._section.offsetHeight + 8) + 'px';
+    var sync = DCP.modules && DCP.modules.sessionSync;
+    if (sync && sync.repositionStatuses) sync.repositionStatuses();
   },
 
   clearGeometry: function () {

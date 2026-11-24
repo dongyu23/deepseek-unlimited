@@ -104,7 +104,7 @@ var SessionPin = {
       DCP.bridge.addStyle(
         '.dcp-pinned-section{position:fixed;z-index:80;display:none;box-sizing:border-box;max-height:35vh;overflow:auto;' +
         'border-bottom:1px solid rgba(127,127,127,.18);box-shadow:0 8px 20px rgba(0,0,0,.12)}' +
-        '.dcp-pinned-row{display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 6px 8px 10px;cursor:pointer;' +
+        '.dcp-pinned-row{position:relative;display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 6px 8px 10px;cursor:pointer;' +
         'font-size:14px;line-height:20px;color:inherit;border-radius:8px}' +
         '.dcp-pinned-row:hover{background:rgba(127,127,127,.12)}' +
         '.dcp-pinned-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
@@ -145,6 +145,8 @@ var SessionPin = {
     this._section.style.background = bg || '#fff';
     this._section.style.color = getComputedStyle(sider || wrap).color;
     wrap.style.paddingTop = (this._section.offsetHeight + 8) + 'px';
+    var sync = DCP.modules && DCP.modules.sessionSync;
+    if (sync && sync.repositionStatuses) sync.repositionStatuses();
   },
 
   clearGeometry: function () {

@@ -326,7 +326,7 @@ var SessionSync = {
     if (this._styleInjected) return;
     this._styleInjected = true;
     DCP.bridge.addStyle(
-      '.dcp-session-status{flex:0 0 12px;width:12px;height:16px;margin:0 2px 0 6px;display:none;' +
+      '.dcp-session-status{position:absolute;top:50%;transform:translateY(-50%);flex:0 0 12px;width:12px;height:16px;margin:0;display:none;' +
       'align-items:center;justify-content:center;pointer-events:none;color:var(--dcp-accent,#3b6cf6)}' +
       '.dcp-session-status[data-state="generating"],.dcp-session-status[data-state="done"]{display:inline-flex}' +
       '.dcp-session-status::before{content:"";display:block;box-sizing:border-box}' +
@@ -352,6 +352,40 @@ var SessionSync = {
         self.renderRows(entries);
       }, function () {});
     }, 80);
+  },
+
+  // 状态点紧贴标题文字右侧，而不是被 flex:1 的标题容器推到最右边。
+  // 标题过长时限制在操作按钮左侧，避免和“更多”按钮重叠。
+  placeStatus: function (row, el) {
+    if (!row || !el) return;
+    var title = row.querySelector('.title-ff6fc9') || row.querySelector('.dcp-pinned-title');
+    if (!title) { el.style.left = ''; return; }
+    var rr = row.getBoundingClientRect();
+    var tr = title.getBoundingClientRect();
+    var textRight = tr.right;
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(title);
+      var rects = range.getClientRects();
+      if (rects.length) textRight = rects[rects.length - 1].right;
+      else textRight = range.getBoundingClientRect().right || textRight;
+    } catch (e) {}
+    textRight = Math.min(textRight || tr.right, tr.right);
+    var left = textRight - rr.left + 6;
+    var action = row.querySelector('[class*="action-"]') || row.querySelector('.dcp-pinned-unpin');
+    if (action) {
+      var ar = action.getBoundingClientRect();
+      if (ar.width > 0) left = Math.min(left, ar.left - rr.left - 18);
+    }
+    el.style.left = Math.max(0, left) + 'px';
+  },
+
+  repositionStatuses: function () {
+    var nodes = document.querySelectorAll('.dcp-session-status');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      this.placeStatus(el.closest('.item-ff6fc9, .dcp-pinned-row'), el);
+    }
   },
 
   renderRows: function (entries) {
@@ -381,6 +415,7 @@ var SessionSync = {
         el.title = DCP.t(state === 'generating' ? '正在生成' : '生成完毕');
         el.setAttribute('aria-label', el.title);
       }
+      self.placeStatus(row, el);
     });
   },
 
@@ -400,12 +435,14 @@ var SessionSync = {
     this._onInteraction = function () { self._lastInteractionAt = Date.now(); };
     this._onFocus = function () { self._lastInteractionAt = Date.now(); };
     this._onBlur = function () { self._seenBlur = true; };
+    this._onResize = function () { self.repositionStatuses(); };
     document.addEventListener('click', this._onRowClick, true);
     document.addEventListener('pointerdown', this._onInteraction, true);
     document.addEventListener('keydown', this._onInteraction, true);
     document.addEventListener('input', this._onInteraction, true);
     this.pageWin().addEventListener('focus', this._onFocus);
     this.pageWin().addEventListener('blur', this._onBlur);
+    this.pageWin().addEventListener('resize', this._onResize);
     this.pageWin().addEventListener('pagehide', this._onPageHide);
   },
 
@@ -648,6 +685,7 @@ var SessionSync = {
     if (this._onPageHide) { try { this.pageWin().removeEventListener('pagehide', this._onPageHide); } catch (e) {} this._onPageHide = null; }
     if (this._onFocus) { try { this.pageWin().removeEventListener('focus', this._onFocus); } catch (e) {} this._onFocus = null; }
     if (this._onBlur) { try { this.pageWin().removeEventListener('blur', this._onBlur); } catch (e) {} this._onBlur = null; }
+    if (this._onResize) { try { this.pageWin().removeEventListener('resize', this._onResize); } catch (e) {} this._onResize = null; }
     if (this._onInteraction) {
       document.removeEventListener('pointerdown', this._onInteraction, true);
       document.removeEventListener('keydown', this._onInteraction, true);
