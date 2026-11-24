@@ -3,8 +3,8 @@
  *
  * 顺序：toolbar（工具条定位，ctxRing/tpsMeter 要用）→ demoapi（设置面板 + fetch 补丁）
  *       → demobridge（工具桥接，由 demoapi 的补丁触发）→ ctxRing（占用环）
- *       → tpsMeter（实时速率）→ demosearch / sessionsync / codedownload /
- *       sessionpin / preview / demopastetxt / tabtitle
+ *       → tpsMeter（实时速率）→ demosearch / sessionsync / thinktimer /
+ *       codedownload / sessionpin / preview / demopastetxt / tabtitle
  * ============================================================ */
 (function () {
   var order = [
@@ -14,6 +14,7 @@
     'tpsMeter',
     'demoSearch',
     'sessionSync',
+    'thinkTimer',
     'codeDownload',
     'sessionPin',
     'preview',

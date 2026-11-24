@@ -113,6 +113,7 @@ var I18N = {
     '正在加载预览…': 'Loading preview…',
     '该文件类型暂不支持内嵌预览，请下载后查看。': 'This file type cannot be previewed inline. Please download it to view.',
     '文件过大，仅显示前 200KB。': 'File is too large; showing the first 200KB.',
+    '正在思考（用时 {n} 秒）': 'Thinking ({n}s)',
     '-- tok/s': '-- tok/s',
     '实时 -- tok/s': 'Live -- tok/s',
     '实时 {n} tok/s': 'Live {n} tok/s',

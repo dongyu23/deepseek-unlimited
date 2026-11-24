@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.18-4D6BFE" alt="version 1.0.18">
+  <img src="https://img.shields.io/badge/version-1.0.19-4D6BFE" alt="version 1.0.19">
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="license MIT">
   <img src="https://img.shields.io/github/stars/dongyu23/deepseek-unlimited?style=flat&color=4D6BFE" alt="GitHub stars">
   <img src="https://img.shields.io/badge/Tampermonkey-4.x%2B-f59e0b" alt="Tampermonkey 4.x+">
-  <img src="https://img.shields.io/badge/userscript-260KB-6366f1" alt="script size">
+  <img src="https://img.shields.io/badge/userscript-270KB-6366f1" alt="script size">
 </p>
 
 > 2026-11-16 起，DeepSeek 因算力紧张对 **C 端免费用户**实施限额：超 7 天不活跃的长对话不能续、单次输入从 8 万字砍到 **4 万字**、每日对话额度触顶后只回「服务器繁忙，使用额度已达上限」——相关话题连续登上热搜。
@@ -38,6 +38,7 @@
 | **会话自动起名** | 官方端点起名腿 / 自定义模型起名 / 关掉，三选一 |
 | **图片与文件** | 文本文件内联；图片转 base64 内联；可按模型是否多模态分别处理 |
 | **上下文占用环** | 输入框旁实时显示 占用/窗口 百分比，悬浮面板给构成占比与缓存命中率（总量与命中率取自接口 usage，是精确值） |
+| **思考实时秒表** | 发送后思考标题实时显示已用秒数，结束后保留官方“已思考（用时 n 秒）” |
 | **跨标签会话同步** | 侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文；刷新只恢复一次当前会话 |
 | **代码块下载** | 在原生“复制”旁补“下载”，按语言保存为 py/js/ts/sh/json 等文件 |
 | **会话置顶** | 会话菜单支持置顶/取消置顶，侧栏顶部独立分组，刷新与跨标签同步后仍保留 |
@@ -161,11 +162,11 @@
 ## 开发
 
 ```bash
-node build.js     # 拼接 src/ → deepseek-unlimited.user.js（约 260KB）
+node build.js     # 拼接 src/ → deepseek-unlimited.user.js（约 270KB）
 ```
 
 - `src/core/` — 配置 / 选择器 / 工具 / i18n
-- `src/modules/` — 请求改写与设置面板、工具桥接、占用环、会话搜索、跨标签同步、代码下载、会话置顶、附件预览、粘贴转 txt、标签页标题、工具条定位
+- `src/modules/` — 请求改写与设置面板、工具桥接、占用环、会话搜索、跨标签同步、思考秒表、代码下载、会话置顶、附件预览、粘贴转 txt、标签页标题、工具条定位
 - `src/assets/official-logo.svg` — 左上角官方标识（构建时内联）
 - `docs/logo.png` — 项目标识（512×512，README 与脚本 `@icon` 都用它）
 
