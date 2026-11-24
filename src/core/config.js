@@ -18,6 +18,7 @@ var DEFAULT_CONFIG = {
   demoShowCtxRing: true,                  // 是否在工具条显示上下文占用环
   demoShowTps: false,                     // 是否在工具条显示实时输出速率
   demoSessionSync: true,                  // 跨标签同步会话状态；后台同会话完成后自动同步正文
+  demoPinnedSessions: [],                 // 置顶会话 ID（按置顶顺序）
   demoSearchLimit: 'unlimited',           // 每轮 web_search 次数上限：unlimited / 2 / 1
   demoToolMode: 'native',                // 工具调用方式：native=DeepSeek 模型驱动搜索（含模型 token 费）/ searchapi=直调搜索 API（仅付搜索费）
   demoBridge: 'auto',                    // 工具桥接：auto(端点非 deepseek 即启用) / on / off

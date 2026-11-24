@@ -2,7 +2,7 @@
 // @name         DeepSeek Unlimited
 // @name:zh-CN   DeepSeek 不限流
 // @namespace    https://github.com/dongyu23/deepseek-unlimited
-// @version      1.0.16
+// @version      1.0.17
 // @description  Use your own API key in DeepSeek's official chat-demo page: any Anthropic-compatible model, no daily quota, no 7-day conversation expiry, no 40k-character input cap.
 // @description:zh-CN 在 DeepSeek 官方的 chat-demo 页面里用你自己的 API Key：任意 Anthropic 兼容模型，没有每日额度上限、没有 7 天不活跃断连、没有单次 4 万字输入限制。搜索/起名/思考/图片/上下文占用环全部保留官网体验。
 // @match        https://cdn.deepseek.com/chat-demo*
@@ -108,7 +108,7 @@ function pageWindow() {
  * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
  * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
 var DCP = {
-  version: '1.0.16',
+  version: '1.0.17',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
@@ -165,6 +165,7 @@ var DEFAULT_CONFIG = {
   demoShowCtxRing: true,                  // 是否在工具条显示上下文占用环
   demoShowTps: false,                     // 是否在工具条显示实时输出速率
   demoSessionSync: true,                  // 跨标签同步会话状态；后台同会话完成后自动同步正文
+  demoPinnedSessions: [],                 // 置顶会话 ID（按置顶顺序）
   demoSearchLimit: 'unlimited',           // 每轮 web_search 次数上限：unlimited / 2 / 1
   demoToolMode: 'native',                // 工具调用方式：native=DeepSeek 模型驱动搜索（含模型 token 费）/ searchapi=直调搜索 API（仅付搜索费）
   demoBridge: 'auto',                    // 工具桥接：auto(端点非 deepseek 即启用) / on / off
@@ -477,6 +478,20 @@ var I18N = {
     '侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文。刷新页面只恢复一次当前会话。': 'Show a spinner while a conversation is generating and a blue dot when it finishes. A background tab viewing the same conversation reloads once after the other tab finishes. Refreshing restores the current conversation once.',
     '正在生成': 'Generating',
     '生成完毕': 'Finished',
+    // 代码下载 / 会话置顶 / 附件预览
+    '下载代码': 'Download code',
+    '下载': 'Download',
+    '已下载 {name}': 'Downloaded {name}',
+    '置顶': 'Pin',
+    '取消置顶': 'Unpin',
+    '已置顶': 'Pinned',
+    '已取消置顶': 'Unpinned',
+    '预览': 'Preview',
+    '关闭预览': 'Close preview',
+    '附件': 'Attachment',
+    '正在加载预览…': 'Loading preview…',
+    '该文件类型暂不支持内嵌预览，请下载后查看。': 'This file type cannot be previewed inline. Please download it to view.',
+    '文件过大，仅显示前 200KB。': 'File is too large; showing the first 200KB.',
     '-- tok/s': '-- tok/s',
     '实时 -- tok/s': 'Live -- tok/s',
     '实时 {n} tok/s': 'Live {n} tok/s',
@@ -4186,6 +4201,10 @@ var SessionSync = {
       this.applySummary(msg);
       return;
     }
+    if (msg.type === 'pins') {
+      DCP.emit('sync:pins', Array.isArray(msg.pins) ? msg.pins : []);
+      return;
+    }
     if (msg.type === 'bye') {
       this.removeTab(msg.tabId);
       this.renderRows();
@@ -4743,6 +4762,603 @@ var SessionSync = {
 };
 DCP.modules.sessionSync = SessionSync;
 
+/* ===== modules/codedownload.js ===== */
+/* ============================================================
+ * modules/codedownload：代码块下载
+ *
+ * demo 原生代码块只有“复制”。这里在横幅里补一个同风格“下载”按钮，
+ * 按语言扩展名保存当前 <pre> 的完整文本；不移动官方节点、不改代码内容。
+ * ============================================================ */
+var CodeDownload = {
+  ICON: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+    '<path d="M8 1.5v8.2m0 0 3.1-3.1M8 9.7 4.9 6.6M2.4 10.2v3.1c0 .7.6 1.2 1.2 1.2h8.8c.7 0 1.2-.6 1.2-1.2v-3.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  EXT: {
+    python: 'py', py: 'py', javascript: 'js', js: 'js', node: 'js', nodejs: 'js',
+    typescript: 'ts', ts: 'ts', tsx: 'tsx', jsx: 'jsx', java: 'java', c: 'c',
+    'c++': 'cpp', cpp: 'cpp', 'c#': 'cs', csharp: 'cs', cs: 'cs', go: 'go',
+    golang: 'go', rust: 'rs', rs: 'rs', ruby: 'rb', rb: 'rb', php: 'php',
+    swift: 'swift', kotlin: 'kt', kt: 'kt', scala: 'scala', dart: 'dart',
+    bash: 'sh', shell: 'sh', sh: 'sh', zsh: 'sh', powershell: 'ps1', ps1: 'ps1',
+    sql: 'sql', mysql: 'sql', postgresql: 'sql', json: 'json', json5: 'json5',
+    yaml: 'yml', yml: 'yml', toml: 'toml', xml: 'xml', html: 'html', htm: 'html',
+    css: 'css', scss: 'scss', less: 'less', markdown: 'md', md: 'md',
+    text: 'txt', txt: 'txt', plaintext: 'txt', diff: 'diff', patch: 'diff',
+    dockerfile: 'dockerfile', makefile: 'mk', lua: 'lua', r: 'r', perl: 'pl',
+    matlab: 'm', 'objective-c': 'm', 'objective-c++': 'mm', assembly: 'asm', asm: 'asm'
+  },
+
+  languageOf: function (block) {
+    var banner = block.querySelector('.md-code-block-banner');
+    if (!banner) return '';
+    var named = banner.querySelector('[class*="name-"]');
+    if (named && named.textContent) return named.textContent.trim().toLowerCase();
+    var text = (banner.textContent || '').trim();
+    if (!text) return '';
+    // 横幅里通常只有一个语言名；复制按钮出现后也只取第一段
+    return text.split(/\s+/)[0].toLowerCase();
+  },
+
+  extOf: function (lang) {
+    lang = String(lang || '').toLowerCase();
+    if (this.EXT[lang]) return this.EXT[lang];
+    if (/^[a-z0-9_+-]{1,16}$/.test(lang)) return lang;
+    return 'txt';
+  },
+
+  ensure: function (block) {
+    if (!block || block.querySelector('.dcp-code-download')) return;
+    var banner = block.querySelector('.md-code-block-banner');
+    if (!banner) return;
+    var copy = Array.prototype.slice.call(banner.querySelectorAll('button')).find(function (b) {
+      return /复制/.test(b.textContent || b.getAttribute('aria-label') || '');
+    });
+    if (!copy) return;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = copy.className + ' dcp-code-download';
+    btn.setAttribute('aria-label', DCP.t('下载代码'));
+    btn.title = DCP.t('下载代码');
+    btn.innerHTML = this.ICON + '<span>' + DCP.t('下载') + '</span>';
+    var self = this;
+    btn.addEventListener('click', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      self.download(block);
+    }, true);
+    copy.insertAdjacentElement('afterend', btn);
+  },
+
+  download: function (block) {
+    var pre = block && block.querySelector('pre');
+    if (!pre) return;
+    var lang = this.languageOf(block);
+    var name = 'code.' + this.extOf(lang);
+    var code = pre.textContent || '';
+    var blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+    Utils.toast(DCP.t('已下载 {name}', { name: name }), 1600);
+  },
+
+  scan: function () {
+    var blocks = document.querySelectorAll('.md-code-block');
+    for (var i = 0; i < blocks.length; i++) {
+      try { this.ensure(blocks[i]); } catch (e) {}
+    }
+  },
+
+  init: function () {
+    var self = this;
+    Utils.onReady(function () {
+      self.scan();
+      new MutationObserver(Utils.throttle(function () { self.scan(); }, 120))
+        .observe(document.body, { childList: true, subtree: true });
+    });
+  }
+};
+DCP.modules.codeDownload = CodeDownload;
+
+/* ===== modules/sessionpin.js ===== */
+/* ============================================================
+ * modules/sessionpin：会话置顶
+ *
+ * demo 的会话摘要没有 pinned 字段，因此置顶状态保存在脚本配置里。原生
+ * 会话行仍留在 React 管理的日期分组中，只把置顶行隐藏；侧栏顶部用独立
+ * DOM 渲染一个“置顶”分组。绝不移动/克隆官网行，避免 React removeChild
+ * 冲突。点击置顶行时转点原生行，官网事件与 ID 映射保持不变。
+ * ============================================================ */
+var SessionPin = {
+  ICON: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+    '<path d="M9.2 1.8h4.9M10.6 1.8v3.4l2.1 2.2H6.2l2.1-2.2V1.8ZM5.4 7.1h8.1M7.2 7.1v3.3c0 1.7-1 2.8-2.4 3.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  _menuRow: null,
+  _menuSid: null,
+  _applying: false,
+  _again: false,
+  _observer: null,
+  _section: null,
+  _rows: {},
+  _wrap: null,
+  _origPaddingTop: '',
+
+  pins: function () {
+    var p = DCP.config.get('demoPinnedSessions');
+    return Array.isArray(p) ? p.filter(function (x) { return typeof x === 'string' && x; }) : [];
+  },
+
+  broadcast: function (pins) {
+    var sync = DCP.modules && DCP.modules.sessionSync;
+    if (sync && sync.enabled()) sync.send({ type: 'pins', pins: pins });
+  },
+
+  toggle: function (sid) {
+    if (!sid) return;
+    var pins = this.pins(), at = pins.indexOf(sid);
+    if (at >= 0) pins.splice(at, 1);
+    else pins.unshift(sid);
+    DCP.config.set('demoPinnedSessions', pins);
+    this.broadcast(pins);
+    this.applyPins();
+    Utils.toast(DCP.t(at >= 0 ? '已取消置顶' : '已置顶'), 1500);
+  },
+
+  captureRow: function (e) {
+    var SEL = DCP.SEL || {};
+    var row = e.target && e.target.closest ? e.target.closest(SEL.sidebarItem || '.item-ff6fc9') : null;
+    if (!row) return;
+    this._menuRow = row;
+    this._menuSid = row.__dcpSessionId || row.getAttribute('data-dcp-session-id') || null;
+  },
+
+  injectMenu: function () {
+    var menus = document.querySelectorAll('[role="menu"]');
+    for (var mi = 0; mi < menus.length; mi++) {
+      var menu = menus[mi];
+      var existing = menu.querySelector('.dcp-pin-item');
+      if (existing) {
+        var oldSid = existing.getAttribute('data-dcp-sid');
+        if (oldSid) this.updateMenuLabel(existing, oldSid);
+        continue;
+      }
+      var items = Array.prototype.slice.call(menu.querySelectorAll('[role="menuitem"]'));
+      var rename = items.find(function (el) { return /重命名/.test(el.textContent || ''); });
+      if (!rename) continue;
+      var sid = this._menuSid;
+      if (!sid && this._menuRow) sid = this._menuRow.__dcpSessionId || this._menuRow.getAttribute('data-dcp-session-id');
+      if (!sid) continue;
+      var item = document.createElement('div');
+      item.setAttribute('role', 'menuitem');
+      item.className = rename.className + ' dcp-pin-item';
+      item.setAttribute('data-dcp-sid', sid);
+      var icon = document.createElement('span');
+      var nativeIcon = rename.querySelector('span');
+      icon.className = nativeIcon ? nativeIcon.className : '';
+      icon.innerHTML = this.ICON;
+      item.appendChild(icon);
+      item.appendChild(document.createTextNode(this.pins().indexOf(sid) >= 0 ? DCP.t('取消置顶') : DCP.t('置顶')));
+      var self = this;
+      item.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation();
+        self.toggle(sid);
+        // 菜单是 React 节点，不能手动 remove；派发一次外部点击/ESC 让官网
+        // 自己关闭，避免下次协调时 removeChild 找不到节点。
+        setTimeout(function () {
+          try { Utils.realClick(document.body); } catch (err) {}
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        }, 0);
+      }, true);
+      menu.appendChild(item);
+    }
+  },
+
+  updateMenuLabel: function (item, sid) {
+    var label = this.pins().indexOf(sid) >= 0 ? DCP.t('取消置顶') : DCP.t('置顶');
+    var textNode = Array.prototype.slice.call(item.childNodes).find(function (n) { return n.nodeType === 3; });
+    if (textNode) textNode.nodeValue = label;
+    else item.appendChild(document.createTextNode(label));
+    item.setAttribute('aria-label', label);
+  },
+
+  ensureSection: function () {
+    if (this._section && this._section.isConnected) return this._section;
+    if (!this._styleInjected) {
+      this._styleInjected = true;
+      DCP.bridge.addStyle(
+        '.dcp-pinned-section{position:fixed;z-index:80;display:none;box-sizing:border-box;max-height:35vh;overflow:auto;' +
+        'border-bottom:1px solid rgba(127,127,127,.18);box-shadow:0 8px 20px rgba(0,0,0,.12)}' +
+        '.dcp-pinned-row{display:flex;align-items:center;gap:6px;min-height:40px;padding:8px 6px 8px 10px;cursor:pointer;' +
+        'font-size:14px;line-height:20px;color:inherit;border-radius:8px}' +
+        '.dcp-pinned-row:hover{background:rgba(127,127,127,.12)}' +
+        '.dcp-pinned-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+        '.dcp-pinned-unpin{flex:0 0 26px;width:26px;height:26px;border:0;border-radius:7px;background:transparent;' +
+        'color:inherit;opacity:.55;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}' +
+        '.dcp-pinned-unpin:hover{background:rgba(127,127,127,.16);opacity:.9}' +
+        '.dcp-pinned-row .dcp-session-status{margin-left:2px}'
+      );
+    }
+    var section = document.createElement('div');
+    section.className = 'section-ac14ac dcp-pinned-section';
+    var header = document.createElement('div');
+    header.className = 'sectionHeader-ac14ac';
+    header.textContent = DCP.t('置顶');
+    section.appendChild(header);
+    document.body.appendChild(section);
+    this._section = section;
+    return section;
+  },
+
+  updateGeometry: function () {
+    var SEL = DCP.SEL || {};
+    var wrap = document.querySelector('[class*="listWrap-"]') || document.querySelector(SEL.sidebarList && SEL.sidebarList.parentElement);
+    if (!wrap) { if (this._section) this._section.style.display = 'none'; return; }
+    var r = wrap.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) { this._section.style.display = 'none'; return; }
+    if (this._wrap !== wrap) {
+      this._wrap = wrap;
+      this._origPaddingTop = wrap.style.paddingTop || '';
+    }
+    var sider = document.querySelector('[class*="sider-"]');
+    var bg = getComputedStyle(sider || wrap).backgroundColor;
+    if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') bg = getComputedStyle(wrap).backgroundColor;
+    this._section.style.display = 'block';
+    this._section.style.left = r.left + 'px';
+    this._section.style.top = r.top + 'px';
+    this._section.style.width = r.width + 'px';
+    this._section.style.background = bg || '#fff';
+    this._section.style.color = getComputedStyle(sider || wrap).color;
+    wrap.style.paddingTop = (this._section.offsetHeight + 8) + 'px';
+  },
+
+  clearGeometry: function () {
+    if (this._wrap && this._wrap.isConnected) this._wrap.style.paddingTop = this._origPaddingTop || '';
+    this._wrap = null;
+    if (this._section) {
+      this._section.remove();
+      this._section = null;
+    }
+    this._rows = {};
+  },
+
+  renderRow: function (sid, summary, nativeRow) {
+    var self = this, section = this._section;
+    var row = this._rows[sid];
+    if (!row) {
+      row = document.createElement('div');
+      row.className = 'dcp-pinned-row';
+      row.setAttribute('data-dcp-sid', sid);
+      var title = document.createElement('span');
+      title.className = 'dcp-pinned-title';
+      row.appendChild(title);
+      var status = document.createElement('span');
+      status.className = 'dcp-session-status';
+      status.setAttribute('role', 'status');
+      row.appendChild(status);
+      var unpin = document.createElement('button');
+      unpin.type = 'button';
+      unpin.className = 'dcp-pinned-unpin';
+      unpin.title = DCP.t('取消置顶');
+      unpin.setAttribute('aria-label', DCP.t('取消置顶'));
+      unpin.innerHTML = this.ICON;
+      unpin.addEventListener('click', function (e) {
+        e.preventDefault(); e.stopPropagation(); self.toggle(sid);
+      }, true);
+      row.appendChild(unpin);
+      row.addEventListener('click', function () {
+        var native = row._dcpNativeRow;
+        if (native && native.isConnected) Utils.realClick(native);
+      });
+      this._rows[sid] = row;
+    }
+    row._dcpNativeRow = nativeRow;
+    row.querySelector('.dcp-pinned-title').textContent = this.normalizeTitle(summary && summary.title);
+    var sync = DCP.modules && DCP.modules.sessionSync;
+    var state = sync && sync.generatingForSid(sid).length ? 'generating' : (sync && sync._done[sid] ? 'done' : '');
+    var status = row.querySelector('.dcp-session-status');
+    if (state) {
+      status.setAttribute('data-state', state);
+      status.title = DCP.t(state === 'generating' ? '正在生成' : '生成完毕');
+      status.setAttribute('aria-label', status.title);
+    } else {
+      status.removeAttribute('data-state'); status.removeAttribute('title'); status.removeAttribute('aria-label');
+    }
+    section.appendChild(row);
+  },
+
+  normalizeTitle: function (s) {
+    s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+    return s || DCP.t('新对话');
+  },
+
+  applyPins: async function () {
+    if (this._applying) { this._again = true; return; }
+    this._applying = true;
+    var self = this;
+    try {
+      do {
+        this._again = false;
+        var search = DCP.modules && DCP.modules.demoSearch;
+        if (!search || typeof search.sidebarRowsWithIds !== 'function') continue;
+        var entries = await search.sidebarRowsWithIds();
+        var pins = this.pins();
+
+        entries.forEach(function (e) {
+          if (!e.row) return;
+          if (pins.indexOf(e.sid) !== -1) {
+            e.row.__dcpPinHidden = true;
+            e.row.style.display = 'none';
+          } else if (e.row.__dcpPinHidden) {
+            e.row.__dcpPinHidden = false;
+            e.row.style.display = '';
+          }
+        });
+
+        if (!pins.length) { self.clearGeometry(); continue; }
+        var section = self.ensureSection();
+        var keep = {};
+        pins.forEach(function (sid) {
+          var hit = entries.find(function (e) { return e.sid === sid; });
+          if (!hit) return;
+          keep[sid] = true;
+          self.renderRow(sid, hit.summary, hit.row);
+        });
+        Object.keys(self._rows).forEach(function (sid) {
+          if (!keep[sid]) { self._rows[sid].remove(); delete self._rows[sid]; }
+        });
+        self.updateGeometry();
+      } while (this._again);
+    } catch (e) {
+    } finally {
+      this._applying = false;
+    }
+  },
+
+  init: function () {
+    var self = this;
+    Utils.onReady(function () {
+      self.applyPins();
+      document.addEventListener('pointerdown', function (e) { self.captureRow(e); }, true);
+      document.addEventListener('click', function (e) { self.captureRow(e); }, true);
+      document.addEventListener('contextmenu', function (e) { self.captureRow(e); }, true);
+      self._observer = new MutationObserver(Utils.throttle(function () {
+        self.injectMenu();
+        self.applyPins();
+      }, 100));
+      self._observer.observe(document.body, { childList: true, subtree: true });
+      window.addEventListener('resize', function () { if (self._section) self.updateGeometry(); });
+    });
+    DCP.on('session:change', function () { self.applyPins(); });
+    DCP.on('session:activity', function () { self.applyPins(); });
+    DCP.on('sync:pins', function (pins) {
+      if (!Array.isArray(pins)) return;
+      DCP.config.set('demoPinnedSessions', pins);
+      self.applyPins();
+    });
+    DCP.on('cfg:change', function (e) {
+      if (e && e.path === 'demoPinnedSessions') self.applyPins();
+    });
+  }
+};
+DCP.modules.sessionPin = SessionPin;
+
+/* ===== modules/preview.js ===== */
+/* ============================================================
+ * modules/preview：图片 / 附件全屏预览
+ *
+ * 事件委托捕获消息区的图片链接和历史附件卡片。demo 已经把本地文件变成
+ * blob URL，图片与 PDF 可以直接显示；文本类读取 blob 文本。Office 等
+ * 浏览器无法内嵌渲染的类型保留下载按钮，不把文件发到第三方预览服务。
+ * ============================================================ */
+var Preview = {
+  TEXT_RE: /\.(txt|md|markdown|csv|tsv|json|json5|ya?ml|toml|xml|html?|css|scss|less|js|mjs|cjs|jsx|ts|tsx|py|go|java|c|cc|cpp|cxx|h|hpp|cs|php|rb|sh|bash|zsh|sql|log|ini|conf|cfg|vue|svelte|tex|bib)$/i,
+  IMAGE_RE: /\.(png|jpe?g|gif|webp|bmp|avif|svg|ico|tiff?)$/i,
+  MAX_TEXT: 200 * 1024,
+  _current: null,
+  _prevFocus: null,
+  _prevOverflow: '',
+
+  kindOf: function (name, mime) {
+    name = String(name || '');
+    mime = String(mime || '').toLowerCase();
+    if (/^image\//.test(mime) || this.IMAGE_RE.test(name)) return 'image';
+    if (mime === 'application/pdf' || /\.pdf$/i.test(name)) return 'pdf';
+    if (/^text\//.test(mime) || this.TEXT_RE.test(name)) return 'text';
+    return 'other';
+  },
+
+  ensureOverlay: function () {
+    if (this.overlay) return this.overlay;
+    DCP.bridge.addStyle(
+      '.dcp-preview-overlay{position:fixed;inset:0;z-index:2147483600;display:none;align-items:center;justify-content:center;' +
+      'background:rgba(0,0,0,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);color:#f5f7fb;font-family:inherit}' +
+      '.dcp-preview-overlay.dcp-on{display:flex}' +
+      '.dcp-preview-panel{width:100%;height:100%;display:flex;flex-direction:column;box-sizing:border-box}' +
+      '.dcp-preview-header{height:54px;flex:0 0 54px;display:flex;align-items:center;gap:12px;padding:0 18px;' +
+      'border-bottom:1px solid rgba(255,255,255,.1);background:rgba(20,22,28,.9)}' +
+      '.dcp-preview-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:600}' +
+      '.dcp-preview-download,.dcp-preview-close{flex:0 0 auto;height:32px;border:1px solid rgba(255,255,255,.16);border-radius:8px;' +
+      'background:rgba(255,255,255,.08);color:#f5f7fb;cursor:pointer;text-decoration:none;font-size:13px;padding:0 12px;' +
+      'display:inline-flex;align-items:center;justify-content:center}' +
+      '.dcp-preview-download:hover,.dcp-preview-close:hover{background:rgba(255,255,255,.16)}' +
+      '.dcp-preview-close{width:34px;padding:0;font-size:20px;line-height:1}' +
+      '.dcp-preview-body{flex:1 1 auto;min-height:0;display:flex;align-items:center;justify-content:center;padding:18px;box-sizing:border-box;overflow:auto}' +
+      '.dcp-preview-body>img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px;box-shadow:0 12px 50px rgba(0,0,0,.45)}' +
+      '.dcp-preview-body>iframe,.dcp-preview-body>embed{width:100%;height:100%;border:0;background:#fff;border-radius:6px}' +
+      '.dcp-preview-body>pre{width:100%;height:100%;margin:0;padding:18px;box-sizing:border-box;overflow:auto;white-space:pre-wrap;' +
+      'word-break:break-word;background:#111319;border:1px solid rgba(255,255,255,.1);border-radius:8px;' +
+      'font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#e6e9ef}' +
+      '.dcp-preview-msg{max-width:520px;text-align:center;line-height:1.7;color:rgba(245,247,251,.72);font-size:14px;padding:24px}' +
+      '.dcp-preview-msg strong{display:block;color:#f5f7fb;font-size:16px;margin-bottom:8px;word-break:break-all}' +
+      '@media (max-width:640px){.dcp-preview-header{padding:0 10px}.dcp-preview-body{padding:8px}.dcp-preview-download{padding:0 9px}}'
+    );
+    var overlay = document.createElement('div');
+    overlay.className = 'dcp-preview-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', DCP.t('预览'));
+    overlay.innerHTML =
+      '<div class="dcp-preview-panel">' +
+        '<div class="dcp-preview-header">' +
+          '<span class="dcp-preview-title"></span>' +
+          '<a class="dcp-preview-download" href="#" download>' + DCP.t('下载') + '</a>' +
+          '<button type="button" class="dcp-preview-close" aria-label="' + DCP.t('关闭预览') + '">×</button>' +
+        '</div>' +
+        '<div class="dcp-preview-body"></div>' +
+      '</div>';
+    document.body.appendChild(overlay);
+    this.overlay = overlay;
+    this.titleEl = overlay.querySelector('.dcp-preview-title');
+    this.bodyEl = overlay.querySelector('.dcp-preview-body');
+    this.downloadEl = overlay.querySelector('.dcp-preview-download');
+    this.closeEl = overlay.querySelector('.dcp-preview-close');
+    var self = this;
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) self.close(); });
+    this.closeEl.addEventListener('click', function () { self.close(); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && self._current) { e.preventDefault(); self.close(); }
+    }, true);
+    return overlay;
+  },
+
+  message: function (title, text) {
+    this.bodyEl.innerHTML = '';
+    var box = document.createElement('div');
+    box.className = 'dcp-preview-msg';
+    var strong = document.createElement('strong');
+    strong.textContent = title || '';
+    var span = document.createElement('span');
+    span.textContent = text || '';
+    box.appendChild(strong); box.appendChild(span);
+    this.bodyEl.appendChild(box);
+  },
+
+  loading: function () {
+    this.bodyEl.innerHTML = '';
+    var box = document.createElement('div');
+    box.className = 'dcp-preview-msg';
+    box.textContent = DCP.t('正在加载预览…');
+    this.bodyEl.appendChild(box);
+  },
+
+  fallback: function (info, extra) {
+    var self = this;
+    this.message(info.name, DCP.t('该文件类型暂不支持内嵌预览，请下载后查看。') + (extra || ''));
+    if (info.href) {
+      var a = document.createElement('a');
+      a.className = 'dcp-preview-download';
+      a.href = info.href; a.download = info.name || '';
+      a.textContent = DCP.t('下载');
+      if (!/^blob:/.test(info.href)) a.target = '_blank';
+      this.bodyEl.appendChild(a);
+    }
+  },
+
+  render: function (info) {
+    var self = this, kind = this.kindOf(info.name, info.mime);
+    this.loading();
+    if (kind === 'image') {
+      var img = document.createElement('img');
+      img.alt = info.name || '';
+      img.onload = function () {
+        if (self._current !== info) return;
+        self.bodyEl.innerHTML = ''; self.bodyEl.appendChild(img);
+      };
+      img.onerror = function () { if (self._current === info) self.fallback(info); };
+      img.src = info.href;
+      return;
+    }
+    if (kind === 'pdf') {
+      var frame = document.createElement('iframe');
+      frame.title = info.name || 'PDF';
+      frame.src = info.href;
+      this.bodyEl.innerHTML = ''; this.bodyEl.appendChild(frame);
+      return;
+    }
+    if (kind === 'text') {
+      fetch(info.href).then(function (r) {
+        if (!r.ok) throw new Error('http ' + r.status);
+        return r.blob();
+      }).then(function (blob) {
+        var truncated = blob.size > self.MAX_TEXT;
+        return (truncated ? blob.slice(0, self.MAX_TEXT) : blob).text().then(function (text) {
+          if (self._current !== info) return;
+          var pre = document.createElement('pre');
+          pre.textContent = text + (truncated ? '\n\n… ' + DCP.t('文件过大，仅显示前 200KB。') : '');
+          self.bodyEl.innerHTML = ''; self.bodyEl.appendChild(pre);
+        });
+      }).catch(function () { if (self._current === info) self.fallback(info); });
+      return;
+    }
+    this.fallback(info, info.sizeHint ? '\n' + info.sizeHint : '');
+  },
+
+  open: function (info) {
+    if (!info || !info.href) return;
+    this.ensureOverlay();
+    this._current = info;
+    this._prevFocus = document.activeElement;
+    this._prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    this.titleEl.textContent = info.name || DCP.t('附件');
+    this.downloadEl.href = info.href;
+    this.downloadEl.download = info.name || '';
+    if (!/^blob:/.test(info.href)) this.downloadEl.target = '_blank';
+    else this.downloadEl.removeAttribute('target');
+    this.overlay.classList.add('dcp-on');
+    this.closeEl.focus();
+    this.render(info);
+  },
+
+  close: function () {
+    if (!this._current) return;
+    this._current = null;
+    this.overlay.classList.remove('dcp-on');
+    this.bodyEl.innerHTML = '';
+    document.body.style.overflow = this._prevOverflow || '';
+    if (this._prevFocus && this._prevFocus.focus) {
+      try { this._prevFocus.focus({ preventScroll: true }); } catch (e) { this._prevFocus.focus(); }
+    }
+    this._prevFocus = null;
+  },
+
+  onClick: function (e) {
+    if (!e.target || e.target.closest('.dcp-preview-overlay')) return;
+    if (e.target.closest('button,input,textarea,[role="button"]')) return;
+    var main = e.target.closest('main');
+    if (!main) return;
+    var self = this;
+
+    // 图片缩略图 / 消息图片
+    var img = e.target.closest('img');
+    if (img && main.contains(img)) {
+      var link = img.closest('a[href]');
+      var src = link ? link.getAttribute('href') : (img.currentSrc || img.src);
+      if (src && (/^blob:/.test(src) || /^https?:/.test(src))) {
+        e.preventDefault(); e.stopPropagation();
+        this.open({ href: src, name: img.alt || link && link.getAttribute('title') || 'image', kind: 'image' });
+        return;
+      }
+    }
+
+    // 历史附件卡片：卡片本身可点，内部隐藏 <a download> 带 blob URL。
+    var card = e.target.closest('[class*="card-"]');
+    if (card && main.contains(card)) {
+      var a = card.querySelector('a[download][href^="blob:"]') || card.closest('a[download][href^="blob:"]');
+      if (!a) return;
+      e.preventDefault(); e.stopPropagation();
+      var name = card.getAttribute('title') || a.getAttribute('download') || a.getAttribute('aria-label') || DCP.t('附件');
+      this.open({ href: a.getAttribute('href'), name: name, sizeHint: (card.innerText || '').replace(name, '').trim() });
+    }
+  },
+
+  init: function () {
+    this.ensureOverlay();
+    document.addEventListener('click', this.onClick.bind(this), true);
+  }
+};
+DCP.modules.preview = Preview;
+
 /* ===== modules/demopastetxt.js ===== */
 /* ============================================================
  * modules/demoPasteTxt：复刻官方「粘贴大段文本自动转成 txt 附件」
@@ -5055,7 +5671,8 @@ DCP.modules.tabTitle = TabTitle;
  *
  * 顺序：toolbar（工具条定位，ctxRing/tpsMeter 要用）→ demoapi（设置面板 + fetch 补丁）
  *       → demobridge（工具桥接，由 demoapi 的补丁触发）→ ctxRing（占用环）
- *       → tpsMeter（实时速率）→ demosearch / sessionsync / demopastetxt / tabtitle
+ *       → tpsMeter（实时速率）→ demosearch / sessionsync / codedownload /
+ *       sessionpin / preview / demopastetxt / tabtitle
  * ============================================================ */
 (function () {
   var order = [
@@ -5065,6 +5682,9 @@ DCP.modules.tabTitle = TabTitle;
     'tpsMeter',
     'demoSearch',
     'sessionSync',
+    'codeDownload',
+    'sessionPin',
+    'preview',
     'demoPasteTxt',
     'tabTitle'
   ];

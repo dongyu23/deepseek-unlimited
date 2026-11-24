@@ -145,6 +145,10 @@ var SessionSync = {
       this.applySummary(msg);
       return;
     }
+    if (msg.type === 'pins') {
+      DCP.emit('sync:pins', Array.isArray(msg.pins) ? msg.pins : []);
+      return;
+    }
     if (msg.type === 'bye') {
       this.removeTab(msg.tabId);
       this.renderRows();

@@ -17,6 +17,9 @@ const ORDER = [
   'modules/tpsmeter.js',
   'modules/demosearch.js',
   'modules/sessionsync.js',
+  'modules/codedownload.js',
+  'modules/sessionpin.js',
+  'modules/preview.js',
   'modules/demopastetxt.js',
   'modules/tabtitle.js',
   'main.js', 'footer.js'
