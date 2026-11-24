@@ -27,7 +27,7 @@
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', sessionSync: 'demoSessionSync', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
   // 只有精确官方域名才允许回退使用页面里的官方 Key；避免
   // https://deepseek.com.example/... 这类地址被正则误判为官方端点。
@@ -129,18 +129,20 @@ var DemoApi = {
     var orig = win.fetch;
     DemoApi._origFetch = orig;   // 桥接的出站请求走原生 fetch，避开本补丁的 URL 改写（否则搜索腿会被改写到第三方端点）
     win.fetch = function (input, init) {
+      var isMessages = false, bridgeHandled = false;
       try {
         var url = typeof input === 'string' ? input : (input && input.url) || '';
+        isMessages = url.indexOf('/anthropic/v1/messages') !== -1;
         // 附件上传：顺手记下 file_id → 正文（详见 captureFile 注释）。必须在
         // 下面的 /messages 分支之前——两者 URL 不重叠，顺序只为少一次判断
         if (url.indexOf('/anthropic/v1/files') !== -1 && init && init.method === 'POST') {
           return self.captureFile(orig, this, url, init);
         }
         // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
-        if (url.indexOf('/anthropic/v1/messages') !== -1 && DCP.config.get('demoCustom')) {
+        if (isMessages && DCP.config.get('demoCustom')) {
           var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
           var officialEndpoint = self.isOfficialEndpoint(base);
-          // 安全边界：官方 Key 只能发给精确的 api.deepseek.com。第三方端点
+          // 安全边界：官方 Key 只能发给精确 api.deepseek.com。第三方端点
           // 必须显式配置独立 Key，绝不静默回退，避免端点写错时泄露官方 Key。
           if (!officialEndpoint && !key) {
             return Promise.reject(new Error(DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。')));
@@ -172,12 +174,23 @@ var DemoApi = {
           // 4) 桥接：端点非 DeepSeek 时，工具执行拆成「客户端工具循环 +
           //    DeepSeek 极小搜索腿」，demo 侧呈现仍为原生块（见 demobridge.js）
           if (DCP.modules.demoBridge && DCP.modules.demoBridge.active()) {
+            bridgeHandled = true;
             var bridged = DCP.modules.demoBridge.intercept(url, init, origDsKey);
             if (bridged) return bridged;
           }
         }
       } catch (e) {}
-      return orig.call(this, url, init);
+      // 官方端点 / 未走桥接的请求也同步生成状态。旁路读取 response.clone()，
+      // 不改页面拿到的响应；桥接请求由 demobridge 自己发 session:activity。
+      var sync = DCP.modules.sessionSync;
+      var syncRec = (isMessages && !bridgeHandled && sync && sync.enabled()) ? sync.beginNativeRequest() : null;
+      try {
+        var p = orig.call(this, url, init);
+        return syncRec ? sync.observeNativeResponse(p, syncRec) : p;
+      } catch (e) {
+        if (syncRec) sync.finishNativeRequest(syncRec, 'error');
+        throw e;
+      }
     };
   },
 
@@ -547,6 +560,8 @@ var DemoApi = {
       DCP.t('在输入工具条发送按钮一侧显示上下文占用环；关闭后仍会继续统计，只是不显示')));
     advBox.appendChild(mkSwitch('显示实时 TPS', 'showTps',
       DCP.t('在上下文占用环左侧显示实时输出速率（thinking + 正文 token/秒）；仅自定义模型桥接工作时生效')));
+    advBox.appendChild(mkSwitch('跨标签同步会话', 'sessionSync',
+      DCP.t('侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文。刷新页面只恢复一次当前会话。')));
     advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
       [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
       'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));

@@ -16,6 +16,7 @@ const ORDER = [
   'modules/ctxring.js',
   'modules/tpsmeter.js',
   'modules/demosearch.js',
+  'modules/sessionsync.js',
   'modules/demopastetxt.js',
   'modules/tabtitle.js',
   'main.js', 'footer.js'

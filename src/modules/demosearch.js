@@ -226,6 +226,135 @@ var DemoSearch = {
     });
   },
 
+  // 侧栏同步只需要摘要，不把 151 条会话的完整消息树全部读进内存。
+  readSummaries: function () {
+    return new Promise(function (resolve) {
+      var rq = null, settled = false, db = null;
+      function done(value) {
+        if (settled) return;
+        settled = true;
+        if (db) { try { db.close(); } catch (e) {} }
+        resolve(value || []);
+      }
+      try { rq = indexedDB.open('chat-demo'); } catch (e) { return done([]); }
+      if (!rq) return done([]);
+      rq.onerror = function () { done([]); };
+      rq.onabort = function () { done([]); };
+      rq.onblocked = function () { done([]); };
+      rq.onsuccess = function () {
+        if (settled) {
+          try { rq.result.close(); } catch (e) {}
+          return;
+        }
+        try {
+          db = rq.result;
+          if (!db.objectStoreNames || !db.objectStoreNames.contains('sessionSummaries')) return done([]);
+          var getAll = db.transaction('sessionSummaries', 'readonly').objectStore('sessionSummaries').getAll();
+          getAll.onsuccess = function () { done(getAll.result || []); };
+          getAll.onerror = function () { done([]); };
+          getAll.onabort = function () { done([]); };
+        } catch (e) { done([]); }
+      };
+    });
+  },
+
+  readSession: function (id) {
+    return new Promise(function (resolve) {
+      var rq = null, settled = false, db = null;
+      function done(value) {
+        if (settled) return;
+        settled = true;
+        if (db) { try { db.close(); } catch (e) {} }
+        resolve(value || null);
+      }
+      if (!id) return done(null);
+      try { rq = indexedDB.open('chat-demo'); } catch (e) { return done(null); }
+      if (!rq) return done(null);
+      rq.onerror = function () { done(null); };
+      rq.onabort = function () { done(null); };
+      rq.onblocked = function () { done(null); };
+      rq.onsuccess = function () {
+        if (settled) {
+          try { rq.result.close(); } catch (e) {}
+          return;
+        }
+        try {
+          db = rq.result;
+          if (!db.objectStoreNames || !db.objectStoreNames.contains('sessions')) return done(null);
+          var get = db.transaction('sessions', 'readonly').objectStore('sessions').get(id);
+          get.onsuccess = function () { done(get.result || null); };
+          get.onerror = function () { done(null); };
+          get.onabort = function () { done(null); };
+        } catch (e) { done(null); }
+      };
+    });
+  },
+
+  // 侧栏行 → 稳定会话 ID。页面没有把 ID 放在 DOM 上，只能按官方自己的排序
+  // （updatedAt 倒序）+ 标题队列还原；当前行再单独用消息树校验。数量不相等
+  // （例如文件夹插件隐藏了行）时只映射标题唯一项，宁可不显示状态也不挂错行。
+  sidebarRowsWithIds: async function () {
+    var SEL = DCP.SEL || {};
+    var rows = SEL.sidebarItem ? Array.prototype.slice.call(document.querySelectorAll(SEL.sidebarItem)) : [];
+    if (!rows.length) return [];
+    var summaries = await this.readSummaries();
+    if (!summaries.length) return rows.map(function (row) { return { row: row, sid: null, summary: null }; });
+    summaries.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    var queues = {}, titleCounts = {};
+    summaries.forEach(function (s) {
+      var title = DemoSearch.normalizeTitle(s.title);
+      (queues[title] || (queues[title] = [])).push(s);
+      titleCounts[title] = (titleCounts[title] || 0) + 1;
+    });
+    var rowTitleCounts = {};
+    var titles = rows.map(function (row) {
+      var el = SEL.sidebarItemTitle ? row.querySelector(SEL.sidebarItemTitle) : null;
+      var title = DemoSearch.normalizeTitle((el || row).textContent);
+      rowTitleCounts[title] = (rowTitleCounts[title] || 0) + 1;
+      return title;
+    });
+    var complete = rows.length === summaries.length;
+    var out = rows.map(function (row, i) {
+      var title = titles[i], sid = null, summary = null;
+      if (complete || (titleCounts[title] === 1 && rowTitleCounts[title] === 1)) {
+        summary = queues[title] && queues[title].length ? queues[title].shift() : null;
+        sid = summary && summary.id || null;
+      }
+      if (sid) {
+        row.__dcpSessionId = sid;
+        row.setAttribute('data-dcp-session-id', sid);
+      } else {
+        delete row.__dcpSessionId;
+        row.removeAttribute('data-dcp-session-id');
+      }
+      return { row: row, sid: sid, summary: summary };
+    });
+
+    // 当前行是唯一能再用消息内容校验的锚点。校验失败说明排序/隐藏导致整份
+    // 映射都不可信，全部撤掉，避免把别的会话的转圈/蓝点挂到当前行。
+    var activeSel = SEL.sidebarItemActive;
+    var active = out.find(function (e) { return activeSel && e.row.matches(activeSel); });
+    if (!active) active = out.find(function (e) { return /(^|\s)active-/.test(e.row.className || ''); });
+    if (active && active.sid) {
+      var session = await this.readSession(active.sid);
+      var titleEl = SEL.chatTitle ? document.querySelector(SEL.chatTitle) : null;
+      var chatTitle = this.normalizeText(titleEl ? titleEl.textContent : '');
+      var titleOk = !chatTitle || this.normalizeTitle(chatTitle) === this.normalizeTitle(session && session.title);
+      // 正文不一致不一定说明映射错了：另一个标签刚写入的新消息还没同步到
+      // 当前 DOM。标题和会话是否存在才是硬校验；正文校验只用于欢迎页/空标题
+      // 这种没有标题可锚定的场景。
+      var contentOk = session ? this.domSessionMatches(session, this.domUsers()) : false;
+      if (!session || !titleOk || (!chatTitle && !contentOk)) {
+        out.forEach(function (e) {
+          e.sid = null; e.summary = null;
+          delete e.row.__dcpSessionId;
+          e.row.removeAttribute('data-dcp-session-id');
+        });
+      }
+    }
+    return out;
+  },
+
   // 沿 selectedChildId 走当前分支（与页面自身读取逻辑一致）
   chain: function (session) {
     var byId = {}, msgs = session.messages || [], i;

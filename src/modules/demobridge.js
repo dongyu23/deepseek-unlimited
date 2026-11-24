@@ -692,11 +692,12 @@ var DemoBridge = {
     };
     // 请求收尾：停计时器，把未经平滑的最终值发出去（「平均」要的是精确值），
     // 再通知空闲
-    var tpsIdle = function () {
+    var tpsIdle = function (state) {
       if (tps.timer) { clearInterval(tps.timer); tps.timer = null; }
       var t = tpsTarget();
       if (t) DCP.emit('tps:update', eventMeta({ tps: t.tps, tokens: t.tokens, elapsed: t.elapsed, estimated: t.estimated, final: true }));
       DCP.emit('tps:idle', eventMeta());
+      DCP.emit('session:activity', eventMeta({ state: state || 'stopped' }));
     };
 
     // 官方 demo 会把工具块从下一次 API 请求里过滤掉，但它自己的 IndexedDB
@@ -784,6 +785,7 @@ var DemoBridge = {
             model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
         }));
         DCP.emit('tps:start', eventMeta());
+        DCP.emit('session:activity', eventMeta({ state: 'generating' }));
         // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
         // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
         // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
@@ -793,8 +795,14 @@ var DemoBridge = {
         var toolRoundIndex = 0;
         var refreshRequestSession = async function () {
           if (!search || typeof search.refreshRequestSession !== 'function' || !requestCtx) return;
+          var before = requestSessionId;
           var s = await search.refreshRequestSession(requestCtx);
           if (s && s.id) requestSessionId = s.id;
+          // 新对话首条消息的 ID 往往到工具轮后才落盘；补发一次带 ID 的生成中
+          // 事件，侧栏与其它标签才能把转圈挂到正确的会话行。
+          if (requestSessionId && requestSessionId !== before) {
+            DCP.emit('session:activity', eventMeta({ state: 'generating' }));
+          }
         };
         // 占用公式与原来完全一致；只是在每轮工具消息追加后也发射一次，
         // 让长任务过程中持续刷新，而不是等到整个工具循环结束才更新。
@@ -846,7 +854,7 @@ var DemoBridge = {
               }, {})
             });
             push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
-            tpsIdle();
+            tpsIdle('error');
             endRequest();
             finish(); return;
           }
@@ -987,9 +995,9 @@ var DemoBridge = {
         }
         push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
         push(self.sseEvent('message_stop', { type: 'message_stop' }));
-        tpsIdle();
+        tpsIdle('done');
       } catch (e) {
-        tpsIdle();
+        tpsIdle(e && e.name === 'AbortError' ? 'stopped' : 'error');
         if (e && e.name === 'AbortError') { finish(); endRequest(); return; }
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }
@@ -998,7 +1006,7 @@ var DemoBridge = {
     })().catch(function (e) {
       // title leg 初始化、ReadableStream 构造等主 try 之前的异常也必须收口，
       // 否则页面会一直停在“停止生成”，既看不到 error 也不关流。
-      tpsIdle();
+      tpsIdle(e && e.name === 'AbortError' ? 'stopped' : 'error');
       if (!(e && e.name === 'AbortError')) {
         push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
       }

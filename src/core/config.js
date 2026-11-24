@@ -17,6 +17,7 @@ var DEFAULT_CONFIG = {
   demoCtxLimit: 128000,                   // 上下文窗口（tokens，占用环百分比用；可填 128000 / 128k / 1m）
   demoShowCtxRing: true,                  // 是否在工具条显示上下文占用环
   demoShowTps: false,                     // 是否在工具条显示实时输出速率
+  demoSessionSync: true,                  // 跨标签同步会话状态；后台同会话完成后自动同步正文
   demoSearchLimit: 'unlimited',           // 每轮 web_search 次数上限：unlimited / 2 / 1
   demoToolMode: 'native',                // 工具调用方式：native=DeepSeek 模型驱动搜索（含模型 token 费）/ searchapi=直调搜索 API（仅付搜索费）
   demoBridge: 'auto',                    // 工具桥接：auto(端点非 deepseek 即启用) / on / off
