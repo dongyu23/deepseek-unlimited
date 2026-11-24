@@ -32,6 +32,10 @@ var SEL = {
   sidebarItemActive: '.item-ff6fc9.active-ff6fc9',
   sidebarItemTitle: '.title-ff6fc9',
   sidebarList: '.section-ac14ac',
+  sidebarRoot: '[class*="sider-"]',
+  sidebarListWrap: '[class*="listWrap-"]',
+  sidebarCollapseBtn: 'button[aria-label="收起边栏"]',
+  sidebarExpandBtn: 'button[aria-label="打开边栏"], button[aria-label="展开侧栏"]',
   // 聊天区标题：demo 页自己渲染的当前会话名（新对话时整个元素不存在）
   chatView: '.view-_5fa77',
   chatHeader: '.header-_5fa77',

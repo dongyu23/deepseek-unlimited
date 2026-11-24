@@ -20,6 +20,7 @@ const ORDER = [
   'modules/thinktimer.js',
   'modules/codedownload.js',
   'modules/sessionpin.js',
+  'modules/officialanimations.js',
   'modules/preview.js',
   'modules/demopastetxt.js',
   'modules/tabtitle.js',
