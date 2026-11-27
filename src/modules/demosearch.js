@@ -51,8 +51,74 @@ var DemoSearch = {
     '<path d="M13.1265 1.81282L14.1871 2.87348L2.8734 14.1872L1.81274 13.1265L13.1265 1.81282Z" fill="currentColor"/></svg>',
   ICON_BUBBLE: '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M10 2C5.58162 2 2.00003 5.58162 2 10C2 11.2255 2.27557 12.3887 2.76953 13.4287L3.07422 14.0674L4.35059 13.4609L4.04785 12.8223L3.90332 12.4971C3.58796 11.7279 3.41406 10.8848 3.41406 10C3.41409 6.36278 6.36277 3.41407 10 3.41406C13.6372 3.41406 16.5859 6.36278 16.5859 10C16.5859 13.6372 13.6372 16.5859 10 16.5859C9.25515 16.5859 8.70984 16.5329 8.22656 16.3994C7.75059 16.2679 7.29925 16.0478 6.75879 15.6709C5.96644 15.1182 4.82978 14.9233 3.89355 15.5146L3.86426 15.5342L3.24121 15.9727L3.70996 17.3721L4.65918 16.7041C5.00017 16.4952 5.50572 16.5226 5.94824 16.8311C6.58879 17.2779 7.18624 17.5792 7.85059 17.7627C8.50781 17.9442 9.19541 18 10 18C14.4184 18 18 14.4184 18 10C18 5.58162 14.4184 2 10 2ZM6.25 10.5566V11.9707H10.1367V10.5566H6.25ZM6.25 9.23438H13.7852V7.82031H6.25V9.23438Z" fill="#81858C"/></svg>',
   Z_INDEX: 2147483400,                 // 项目内阶梯：高于 toast(2147483000)，低于设置面板(2147483500)
+  // IndexedDB 异常（阻塞、事务不结束、浏览器隐私模式卡住）不能让桥接请求、
+  // 侧栏映射或后台持久化无限等待。测试里会把这两个值调小。
+  IDB_TIMEOUT_MS: 3000,
+  SESSION_REFRESH_TIMEOUT_MS: 2500,
+  _bridgeWriteQueues: null,
+  _queryToken: null,
+  _releaseFocus: null,
+  _results: [],
+  _activeIndex: -1,
 
   active: function () { return location.hostname === 'cdn.deepseek.com'; },
+
+  dict: function () {
+    if (DCP.ui && typeof DCP.ui.dict === 'function') return DCP.ui.dict();
+    if (typeof Utils !== 'undefined' && Utils.dict) return Utils.dict();
+    return Object.create(null);
+  },
+
+  own: function (object, key) {
+    if (DCP.ui && typeof DCP.ui.own === 'function') return DCP.ui.own(object, key);
+    return !!object && Object.prototype.hasOwnProperty.call(object, key);
+  },
+
+  setAttr: function (el, name, value) {
+    if (!el || !name) return false;
+    if (DCP.ui && typeof DCP.ui.setAttributeIfChanged === 'function') return DCP.ui.setAttributeIfChanged(el, name, value);
+    if (value == null) {
+      if (el.hasAttribute && el.hasAttribute(name)) { el.removeAttribute(name); return true; }
+      return false;
+    }
+    var next = String(value);
+    if (el.getAttribute && el.getAttribute(name) === next) return false;
+    el.setAttribute(name, next);
+    return true;
+  },
+
+  setText: function (el, value) {
+    if (!el) return false;
+    if (DCP.ui && typeof DCP.ui.setTextIfChanged === 'function') return DCP.ui.setTextIfChanged(el, value);
+    if (typeof Utils !== 'undefined' && Utils.setTextIfChanged) return Utils.setTextIfChanged(el, value);
+    var next = String(value == null ? '' : value);
+    if (el.textContent === next) return false;
+    el.textContent = next;
+    return true;
+  },
+
+  cancelQuery: function () {
+    if (this._queryToken && DCP.ui && typeof DCP.ui.invalidateQuery === 'function') {
+      DCP.ui.invalidateQuery(this._queryToken);
+    }
+    this._queryToken = null;
+  },
+
+  isQueryCurrent: function (token) {
+    if (DCP.ui && typeof DCP.ui.isQueryCurrent === 'function') return DCP.ui.isQueryCurrent(token);
+    return this._queryToken === token;
+  },
+
+  // 所有 IDB 读写共用的硬 deadline。超时后由调用方提供的 cleanup 中止事务/
+  // 关闭连接；迟到回调仍有 settled 保护，不会在超时后继续写盘。
+  withIdbTimeout: function (promise, fallback, cleanup) {
+    var self = this;
+    return Utils.withTimeout(promise, self.IDB_TIMEOUT_MS, 'IndexedDB operation timed out')
+      .catch(function () {
+        if (cleanup) { try { cleanup(); } catch (e) {} }
+        return fallback;
+      });
+  },
 
   init: function () {
     if (!this.active()) return;
@@ -66,6 +132,11 @@ var DemoSearch = {
       }, 100)).observe(document.body, { childList: true, subtree: true });
       // 主题切换：只更新根节点上的配色变量，已渲染条目自动跟随
       Utils.onThemeChange(function () { self.paint(); });
+    });
+    // 会话代次变化后，旧查询即使晚返回也不能覆盖新会话的搜索结果。
+    DCP.on('session:change', function () {
+      self.cancelQuery();
+      if (self.overlay && self.overlay.style.display === 'block') self.close();
     });
   },
 
@@ -118,11 +189,16 @@ var DemoSearch = {
     overlay.id = 'dcp-search-mask';
     overlay.style.cssText = 'position:fixed;inset:0;z-index:' + this.Z_INDEX + ';background:' + p.mask +
       ';backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px)';
-    overlay.addEventListener('click', function () { self.close(); });
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) self.close();
+    });
 
     var surface = document.createElement('div');
     surface.id = 'dcp-search-modal';
     surface.setAttribute('role', 'dialog');
+    surface.setAttribute('aria-modal', 'true');
+    surface.setAttribute('aria-label', DCP.t('搜索对话内容...'));
+    surface.tabIndex = -1;
     // font-family:inherit——表单控件（input/button）默认不继承字体，会掉到
     // Arial（实测），整层显式继承页面字体才与官方一致
     surface.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:' + (this.Z_INDEX + 1) +
@@ -137,23 +213,32 @@ var DemoSearch = {
     ico.style.cssText = 'flex:0 0 auto;display:inline-flex;color:' + p.dim;
     ico.innerHTML = this.ICON_MAGNIFIER;
     var input = document.createElement('input');
+    input.id = 'dcp-search-input';
     input.type = 'text';
     input.placeholder = DCP.t('搜索对话内容...');
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-controls', 'dcp-search-list');
+    input.setAttribute('aria-expanded', 'true');
     // font-family/line-height:inherit——input 默认不继承（实测掉到 Arial），
-    // 必须显式继承页面字体才与官方浮层一致；官方输入框行高实测 24px
+    // 必须显式继承页面字体才与官方一致；官方输入框行高实测 24px
     input.style.cssText = 'flex:1 1 auto;min-width:0;height:24px;border:none;outline:none;background:transparent;' +
       'font-size:16px;font-family:inherit;line-height:24px;color:' + p.text;
     input.addEventListener('input', Utils.debounce(function () { self.runSearch(input.value); }, 200));
+    input.addEventListener('keydown', function (e) { self.onInputKey(e); });
     var close = document.createElement('button');
     close.type = 'button';
     close.style.cssText = 'box-sizing:border-box;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;' +
       'width:34px;height:34px;border:none;outline:none;cursor:pointer;border-radius:8px;background:transparent;color:' + p.dim;
     close.innerHTML = this.ICON_CLOSE;
+    close.setAttribute('aria-label', DCP.t('关闭'));
     close.addEventListener('click', function () { self.close(); });
     box.appendChild(ico); box.appendChild(input); box.appendChild(close);
 
     var list = document.createElement('div');
     list.id = 'dcp-search-list';
+    list.setAttribute('role', 'listbox');
+    list.setAttribute('aria-label', DCP.t('搜索结果'));
     // 官方实测：滚动容器无 padding，其内层 items 容器 padding 8px 8px 0
     list.style.cssText = 'box-sizing:border-box;flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;' +
       'padding:8px 8px 0';
@@ -163,16 +248,22 @@ var DemoSearch = {
     document.body.appendChild(overlay);
 
     this.overlay = overlay; this.surface = surface; this.input = input; this.list = list;
-    // Esc 关闭（打开期间常驻，关闭后不拦键）
+    // 没有 DCP.ui 时仍保留 Esc 兜底；正常情况下由 trapFocus 统一处理。
     this._onKey = function (e) { if (e.key === 'Escape') self.close(); };
   },
 
   paint: function () {
     if (!this.overlay) return;
     var p = this.pal();
-    this.overlay.style.background = p.mask;
-    this.surface.style.background = p.surface;
-    this.input.style.color = p.text;
+    if (DCP.ui && typeof DCP.ui.setStyleIfChanged === 'function') {
+      DCP.ui.setStyleIfChanged(this.overlay, 'background', p.mask);
+      DCP.ui.setStyleIfChanged(this.surface, 'background', p.surface);
+      DCP.ui.setStyleIfChanged(this.input, 'color', p.text);
+    } else {
+      this.overlay.style.background = p.mask;
+      this.surface.style.background = p.surface;
+      this.input.style.color = p.text;
+    }
     this.list.querySelectorAll('[data-dcp-s-text]').forEach(function (el) { el.style.color = p.text; });
     this.list.querySelectorAll('[data-dcp-s-dim]').forEach(function (el) { el.style.color = p.dim; });
     this.list.querySelectorAll('[data-dcp-s-snippet]').forEach(function (el) { el.style.color = p.snippet; });
@@ -180,24 +271,90 @@ var DemoSearch = {
 
   open: function () {
     this.build();
+    this.cancelQuery();
     this.overlay.style.display = 'block';
     this.paint();
     this.input.value = '';
     this.list.innerHTML = '';
-    this.input.focus();
-    document.addEventListener('keydown', this._onKey, true);
+    this._results = [];
+    this._activeIndex = -1;
+    this.setAttr(this.input, 'aria-activedescendant', null);
+    if (this._releaseFocus) { try { this._releaseFocus(); } catch (e) {} this._releaseFocus = null; }
+    if (DCP.ui && typeof DCP.ui.trapFocus === 'function') {
+      this._releaseFocus = DCP.ui.trapFocus(this.surface, {
+        initialFocus: this.input,
+        onEscape: function () { self.close(); }
+      });
+    } else {
+      this.input.focus();
+      document.addEventListener('keydown', this._onKey, true);
+    }
   },
 
   close: function () {
+    this.cancelQuery();
     if (!this.overlay) return;
     this.overlay.style.display = 'none';
     document.removeEventListener('keydown', this._onKey, true);
+    if (this._releaseFocus) {
+      try { this._releaseFocus(); } catch (e) {}
+      this._releaseFocus = null;
+    }
+  },
+
+  setActiveIndex: function (index) {
+    var self = this;
+    var count = this._results.length;
+    if (!count) { this._activeIndex = -1; this.setAttr(this.input, 'aria-activedescendant', null); return; }
+    index = Math.max(0, Math.min(count - 1, Number(index) || 0));
+    this._activeIndex = index;
+    var items = this.list.querySelectorAll('[role="option"]');
+    Array.prototype.forEach.call(items, function (item, i) {
+      self.setAttr(item, 'aria-selected', i === index ? 'true' : 'false');
+      if (i === index) {
+        item.style.background = self.pal().hover;
+        try { item.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+      } else {
+        item.style.background = 'transparent';
+      }
+    });
+    var active = items[index];
+    this.setAttr(this.input, 'aria-activedescendant', active ? active.id : null);
+  },
+
+  onInputKey: function (e) {
+    if (!e) return;
+    if (e.key === 'Escape') { e.preventDefault(); this.close(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!this._results.length) return;
+      var next = this._activeIndex;
+      if (e.key === 'ArrowDown') next = next < 0 ? 0 : (next + 1) % this._results.length;
+      else next = next < 0 ? this._results.length - 1 : (next - 1 + this._results.length) % this._results.length;
+      this.setActiveIndex(next);
+      return;
+    }
+    if (e.key === 'Home' || e.key === 'End') {
+      if (!this._results.length) return;
+      e.preventDefault();
+      this.setActiveIndex(e.key === 'Home' ? 0 : this._results.length - 1);
+      return;
+    }
+    if (e.key === 'Enter') {
+      var index = this._activeIndex >= 0 ? this._activeIndex : (this._results.length === 1 ? 0 : -1);
+      if (index >= 0 && this._results[index]) {
+        e.preventDefault();
+        this.openSession(this._results[index].id);
+      }
+    }
   },
 
   /* ---------- 数据：读本地会话，沿活跃消息链收集可搜文本 ---------- */
   readSessions: function () {
-    return new Promise(function (resolve) {
-      var rq = null, settled = false, db = null;
+    var self = this;
+    var tx = null, db = null;
+    return this.withIdbTimeout(new Promise(function (resolve) {
+      var rq = null, settled = false;
       function done(value) {
         if (settled) return;
         settled = true;
@@ -217,19 +374,27 @@ var DemoSearch = {
         try {
           db = rq.result;
           if (!db.objectStoreNames || !db.objectStoreNames.contains('sessions')) return done([]);
-          var getAll = db.transaction('sessions', 'readonly').objectStore('sessions').getAll();
+          tx = db.transaction('sessions', 'readonly');
+          var getAll = tx.objectStore('sessions').getAll();
           getAll.onsuccess = function () { done(getAll.result || []); };
           getAll.onerror = function () { done([]); };
           getAll.onabort = function () { done([]); };
+          tx.onabort = function () { done([]); };
+          tx.onerror = function () { done([]); };
         } catch (e) { done([]); }
       };
+    }), [], function () {
+      try { if (tx) tx.abort(); } catch (e) {}
+      try { if (db) db.close(); } catch (e) {}
     });
   },
 
   // 侧栏同步只需要摘要，不把 151 条会话的完整消息树全部读进内存。
   readSummaries: function () {
-    return new Promise(function (resolve) {
-      var rq = null, settled = false, db = null;
+    var self = this;
+    var tx = null, db = null;
+    return this.withIdbTimeout(new Promise(function (resolve) {
+      var rq = null, settled = false;
       function done(value) {
         if (settled) return;
         settled = true;
@@ -249,18 +414,26 @@ var DemoSearch = {
         try {
           db = rq.result;
           if (!db.objectStoreNames || !db.objectStoreNames.contains('sessionSummaries')) return done([]);
-          var getAll = db.transaction('sessionSummaries', 'readonly').objectStore('sessionSummaries').getAll();
+          tx = db.transaction('sessionSummaries', 'readonly');
+          var getAll = tx.objectStore('sessionSummaries').getAll();
           getAll.onsuccess = function () { done(getAll.result || []); };
           getAll.onerror = function () { done([]); };
           getAll.onabort = function () { done([]); };
+          tx.onabort = function () { done([]); };
+          tx.onerror = function () { done([]); };
         } catch (e) { done([]); }
       };
+    }), [], function () {
+      try { if (tx) tx.abort(); } catch (e) {}
+      try { if (db) db.close(); } catch (e) {}
     });
   },
 
   readSession: function (id) {
-    return new Promise(function (resolve) {
-      var rq = null, settled = false, db = null;
+    var self = this;
+    var tx = null, db = null;
+    return this.withIdbTimeout(new Promise(function (resolve) {
+      var rq = null, settled = false;
       function done(value) {
         if (settled) return;
         settled = true;
@@ -281,13 +454,182 @@ var DemoSearch = {
         try {
           db = rq.result;
           if (!db.objectStoreNames || !db.objectStoreNames.contains('sessions')) return done(null);
-          var get = db.transaction('sessions', 'readonly').objectStore('sessions').get(id);
+          tx = db.transaction('sessions', 'readonly');
+          var get = tx.objectStore('sessions').get(id);
           get.onsuccess = function () { done(get.result || null); };
           get.onerror = function () { done(null); };
           get.onabort = function () { done(null); };
+          tx.onabort = function () { done(null); };
+          tx.onerror = function () { done(null); };
         } catch (e) { done(null); }
       };
+    }), null, function () {
+      try { if (tx) tx.abort(); } catch (e) {}
+      try { if (db) db.close(); } catch (e) {}
     });
+  },
+
+  // 后台流没有官方 React reader 帮我们落盘。把桥接已经解析出的官方块形状
+  // 合并回会话里的指定 assistant。这里绝不退回“最后一条 assistant”——请求
+  // 身份必须先由 bridgeMessageId / assistantMessageId 精确定位，避免并发请求
+  // 或重复提示词把内容写进另一轮。
+  applyBridgeState: function (session, state) {
+    if (!session || !state) return false;
+    var wantedId = state.assistantMessageId || state.bridgeMessageId;
+    if (!wantedId) return false;
+    var target = null;
+    (session.messages || []).some(function (m) {
+      if (m && m.role === 'assistant' && m.id === wantedId) { target = m; return true; }
+      return false;
+    });
+    if (!target) return false;
+
+    var revision = Number(state.revision != null ? state.revision : state.persistRevision);
+    var hasRevision = isFinite(revision);
+    if (hasRevision) {
+      var current = Number(target.__dcpBridgeRevision);
+      if (isFinite(current) && revision < current) return false;
+    }
+    if (Array.isArray(state.blocks) && state.blocks.length) target.blocks = state.blocks;
+    if (state.status) target.status = state.status;
+    if (Object.prototype.hasOwnProperty.call(state, 'stopReason')) target.stopReason = state.stopReason;
+    if (state.usage) target.usage = state.usage;
+    if (hasRevision) target.__dcpBridgeRevision = revision;
+    session.updatedAt = Date.now();
+    return true;
+  },
+
+  // 官方 assistant 占位符可能在校验会话前就已存在，也可能在 message_start
+  // 之后才由 React 写入 IndexedDB。只认两类安全身份：精确 bridge id，或父
+  // 消息已匹配、且全库唯一的 pending/streaming 空占位符。
+  isBridgePlaceholder: function (m) {
+    if (!m || m.role !== 'assistant') return false;
+    if (m.status === 'pending' || m.status === 'streaming') return true;
+    var emptyBlocks = !Array.isArray(m.blocks) || m.blocks.length === 0;
+    return !m.status && emptyBlocks && !m.stopReason;
+  },
+
+  captureBridgeAssistantId: function (ctx, session, bodyMessages) {
+    if (!ctx || !session) return null;
+    if (ctx.assistantMessageId) return ctx.assistantMessageId;
+    var messages = session.messages || [];
+    if (ctx.bridgeMessageId) {
+      for (var i = 0; i < messages.length; i++) {
+        if (messages[i] && messages[i].role === 'assistant' && messages[i].id === ctx.bridgeMessageId) {
+          ctx.assistantMessageId = messages[i].id;
+          return ctx.assistantMessageId;
+        }
+      }
+    }
+
+    var chain = this.chain(session);
+    var expectedParentId = null;
+    if (Array.isArray(bodyMessages)) {
+      var lastBodyUser = null;
+      for (var b = bodyMessages.length - 1; b >= 0; b--) {
+        if (bodyMessages[b] && bodyMessages[b].role === 'user') { lastBodyUser = bodyMessages[b]; break; }
+      }
+      if (lastBodyUser) {
+        for (var c = chain.length - 1; c >= 0; c--) {
+          if (chain[c] && chain[c].role === 'user' && this.shapeCompatible(chain[c], lastBodyUser, false)) {
+            expectedParentId = chain[c].id;
+            break;
+          }
+        }
+      }
+    }
+    if (!expectedParentId && chain.length && chain[chain.length - 1].role === 'user') {
+      expectedParentId = chain[chain.length - 1].id;
+    }
+
+    var candidates = messages.filter(function (m) {
+      if (!this.isBridgePlaceholder(m)) return false;
+      return !expectedParentId || m.parentId === expectedParentId;
+    }, this);
+    if (!candidates.length && !expectedParentId) {
+      var tail = chain[chain.length - 1];
+      if (tail && this.isBridgePlaceholder(tail)) candidates = [tail];
+    }
+    if (candidates.length !== 1) return null;
+    ctx.assistantMessageId = candidates[0].id;
+    return ctx.assistantMessageId;
+  },
+
+  // 单次 IDB 写入。调用方负责串行化；这里只做“读取指定会话 → 精确更新
+  // assistantMessageId → 原子提交”。任何迟到回调在超时/失败后都不会再写。
+  _persistBridgeStateOnce: function (sessionId, state) {
+    var self = this;
+    var tx = null, db = null;
+    return this.withIdbTimeout(new Promise(function (resolve) {
+      var rq = null, settled = false;
+      function done(value) {
+        if (settled) return;
+        settled = true;
+        if (db) { try { db.close(); } catch (e) {} }
+        resolve(!!value);
+      }
+      try { rq = indexedDB.open('chat-demo'); } catch (e) { return done(false); }
+      if (!rq) return done(false);
+      rq.onerror = function () { done(false); };
+      rq.onabort = function () { done(false); };
+      rq.onblocked = function () { done(false); };
+      rq.onsuccess = function () {
+        if (settled) {
+          try { rq.result.close(); } catch (e) {}
+          return;
+        }
+        try {
+          db = rq.result;
+          if (!db.objectStoreNames || !db.objectStoreNames.contains('sessions')) return done(false);
+          tx = db.transaction('sessions', 'readwrite');
+          var store = tx.objectStore('sessions');
+          var wrote = false;
+          var get = store.get(sessionId);
+          get.onsuccess = function () {
+            if (settled) return;
+            var session = get.result;
+            if (!session || !self.applyBridgeState(session, state)) {
+              try { tx.abort(); } catch (e) {}
+              return done(false);
+            }
+            try { store.put(session); wrote = true; } catch (e) {
+              try { tx.abort(); } catch (err) {}
+              return done(false);
+            }
+          };
+          get.onerror = function () { done(false); };
+          get.onabort = function () { done(false); };
+          tx.oncomplete = function () { done(wrote); };
+          tx.onerror = function () { done(false); };
+          tx.onabort = function () { done(false); };
+        } catch (e) { done(false); }
+      };
+    }), false, function () {
+      try { if (tx) tx.abort(); } catch (e) {}
+      try { if (db) db.close(); } catch (e) {}
+    });
+  },
+
+  persistBridgeState: function (sessionId, state, ctx) {
+    if (!sessionId || !state) return Promise.resolve(false);
+    var self = this;
+    // 入队时冻结快照：队列前的调用若随后继续修改 blocks，不能污染旧 revision。
+    var snapshot;
+    try { snapshot = JSON.parse(JSON.stringify(state)); } catch (e) { snapshot = state; }
+    var queue = ctx && ctx.persistQueue ? Promise.resolve(ctx.persistQueue) : null;
+    if (!queue) {
+      this._bridgeWriteQueues = this._bridgeWriteQueues || Utils.dict();
+      queue = this._bridgeWriteQueues[sessionId] || Promise.resolve();
+    }
+    var result = queue.then(function () {
+      return self._persistBridgeStateOnce(sessionId, snapshot);
+    }, function () {
+      return self._persistBridgeStateOnce(sessionId, snapshot);
+    });
+    var tail = result.then(function () {}, function () {});
+    if (ctx) ctx.persistQueue = tail;
+    else this._bridgeWriteQueues[sessionId] = tail;
+    return result;
   },
 
   // 侧栏行 → 稳定会话 ID。页面没有把 ID 放在 DOM 上，只能按官方自己的排序
@@ -300,13 +642,13 @@ var DemoSearch = {
     var summaries = await this.readSummaries();
     if (!summaries.length) return rows.map(function (row) { return { row: row, sid: null, summary: null }; });
     summaries.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
-    var queues = {}, titleCounts = {};
+    var queues = this.dict(), titleCounts = this.dict();
     summaries.forEach(function (s) {
       var title = DemoSearch.normalizeTitle(s.title);
       (queues[title] || (queues[title] = [])).push(s);
       titleCounts[title] = (titleCounts[title] || 0) + 1;
     });
-    var rowTitleCounts = {};
+    var rowTitleCounts = this.dict();
     var titles = rows.map(function (row) {
       var el = SEL.sidebarItemTitle ? row.querySelector(SEL.sidebarItemTitle) : null;
       var title = DemoSearch.normalizeTitle((el || row).textContent);
@@ -357,7 +699,7 @@ var DemoSearch = {
 
   // 沿 selectedChildId 走当前分支（与页面自身读取逻辑一致）
   chain: function (session) {
-    var byId = {}, msgs = session.messages || [], i;
+    var byId = this.dict(), msgs = session.messages || [], i;
     for (i = 0; i < msgs.length; i++) byId[msgs[i].id] = msgs[i];
     var root = null;
     for (i = 0; i < msgs.length; i++) if (msgs[i].parentId == null) { root = msgs[i]; break; }
@@ -381,7 +723,7 @@ var DemoSearch = {
   // 空文本的附件会话因为 text==='' 而被当成同一个。
   messageAttachments: function (m) {
     if (!m) return [];
-    var out = [], seen = {}, self = this;
+    var out = [], seen = this.dict(), self = this;
     function add(type, name, id, mimeType) {
       type = type === 'image' ? 'image' : 'document';
       name = self.normalizeText(name);
@@ -452,7 +794,7 @@ var DemoSearch = {
     var filesRoot = null;
     try { filesRoot = root.querySelector('[class*="files-"]'); } catch (e) {}
     var rootClass = String((filesRoot && filesRoot.className) || root.className || '');
-    var out = [], seen = {};
+    var out = [], seen = this.dict();
     cards.forEach(function (card) {
       var name = card.getAttribute('title') || card.getAttribute('download') ||
         card.getAttribute('aria-label') || card.textContent || '';
@@ -546,19 +888,24 @@ var DemoSearch = {
   /* ---------- 请求纪元：切会话后丢弃上一请求的迟到事件 ---------- */
   _sessionEpoch: 0,
   _requestSeq: 0,
-  _requests: {},
+  _requests: Object.create(null),
   invalidateRequests: function () {
     this._sessionEpoch++;
-    this._requests = {};
+    this._requests = this.dict();
   },
   beginRequest: function () {
     var self = this;
     var id = 'dcpr_' + Date.now().toString(36) + '_' + (++this._requestSeq).toString(36);
-    var ctx = { requestId: id, epoch: this._sessionEpoch, sessionId: null, session: null };
+    var ctx = {
+      requestId: id, epoch: this._sessionEpoch, sessionId: null, session: null,
+      bridgeMessageId: null, assistantMessageId: null,
+      persistRevision: 0, persistQueue: Promise.resolve()
+    };
     ctx.session = this.currentSession().then(function (s) {
       if (ctx.epoch !== self._sessionEpoch) return null;
       ctx.session = s || null;
       ctx.sessionId = s && s.id || null;
+      if (s) self.captureBridgeAssistantId(ctx, s);
       return ctx.session;
     }, function () { return null; });
     this._requests[id] = ctx;
@@ -567,10 +914,11 @@ var DemoSearch = {
   refreshRequestSession: async function (ctx) {
     if (!ctx || !this._requests[ctx.requestId] || ctx.epoch !== this._sessionEpoch) return null;
     try {
-      var s = await this.currentSession();
+      var s = await Utils.withTimeout(this.currentSession(), this.SESSION_REFRESH_TIMEOUT_MS, 'session refresh timed out');
       if (ctx.epoch !== this._sessionEpoch || !this._requests[ctx.requestId]) return null;
       ctx.session = s || null;
       ctx.sessionId = s && s.id || null;
+      if (s) this.captureBridgeAssistantId(ctx, s);
       return ctx.session;
     } catch (e) { return null; }
   },
@@ -618,12 +966,25 @@ var DemoSearch = {
 
   runSearch: async function (q) {
     q = String(q || '').trim();
-    if (!q) { this.list.innerHTML = ''; return; }
-    var sessions = await this.readSessions();
-    // 与侧边栏同序：updatedAt 降序（索引即侧边栏条目位置）
+    this.cancelQuery();
+    if (!q) {
+      this._results = [];
+      this._activeIndex = -1;
+      if (this.list) this.list.innerHTML = '';
+      return;
+    }
+    var token = DCP.ui && typeof DCP.ui.createQueryToken === 'function'
+      ? DCP.ui.createQueryToken()
+      : { id: Date.now(), epoch: 0, sid: '', cancelled: false };
+    this._queryToken = token;
+    var sessions;
+    try { sessions = await this.readSessions(); }
+    catch (e) { return; }
+    if (!this.isQueryCurrent(token)) return;
+    // 与侧栏同序：updatedAt 降序
     sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
     var ql = q.toLowerCase(), self = this, results = [];
-    sessions.forEach(function (s, idx) {
+    sessions.forEach(function (s) {
       var title = (s.title || '').trim();
       var titleHit = title && title.toLowerCase().indexOf(ql) !== -1;
       var hits = [];
@@ -638,10 +999,11 @@ var DemoSearch = {
         hits.push({ role: 'user', text: firstUser });
       }
       hits.forEach(function (h, i) {
-        results.push({ idx: idx, title: title, updatedAt: s.updatedAt || 0, text: h.text, n: i + 1, m: hits.length });
+        results.push({ id: s.id, title: title, updatedAt: s.updatedAt || 0, text: h.text, n: i + 1, m: hits.length });
       });
     });
-    this.render(q, results);
+    if (!this.isQueryCurrent(token)) return;
+    this.render(q, results, token);
   },
 
   /* ---------- 渲染 ---------- */
@@ -663,25 +1025,33 @@ var DemoSearch = {
     return (d.getMonth() + 1) + '月' + d.getDate() + '日';
   },
 
-  render: function (q, results) {
+  render: function (q, results, token) {
+    if (token && !this.isQueryCurrent(token)) return;
     var self = this, p = this.pal();
+    this._results = results || [];
+    this._activeIndex = -1;
+    this.setAttr(this.input, 'aria-activedescendant', null);
     this.list.innerHTML = '';
-    if (!results.length) {
+    if (!this._results.length) {
       var empty = document.createElement('div');
+      empty.setAttribute('role', 'status');
       empty.style.cssText = 'box-sizing:border-box;padding:24px 16px;text-align:center;font-size:13px;color:' + p.dim;
-      empty.textContent = DCP.t('暂无相关结果');
+      this.setText(empty, DCP.t('暂无相关结果'));
       this.list.appendChild(empty);
       return;
     }
-    results.forEach(function (r) {
+    this._results.forEach(function (r, resultIndex) {
       var item = document.createElement('div');
+      item.id = 'dcp-search-option-' + resultIndex;
       item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', 'false');
+      item.tabIndex = -1;
       // 官方实测：flex/center/gap 12、padding 10 12 10 10、圆角 16
       item.style.cssText = 'box-sizing:border-box;display:flex;align-items:center;gap:12px;' +
         'padding:10px 12px 10px 10px;border-radius:16px;cursor:pointer;flex:0 0 auto';
-      item.addEventListener('mouseenter', function () { item.style.background = self.pal().hover; });
+      item.addEventListener('mouseenter', function () { self.setActiveIndex(resultIndex); });
       item.addEventListener('mouseleave', function () { item.style.background = 'transparent'; });
-      item.addEventListener('click', function () { self.openSession(r.idx); });
+      item.addEventListener('click', function () { self.openSession(r.id); });
 
       var ico = document.createElement('span');
       ico.style.cssText = 'flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px';
@@ -696,11 +1066,11 @@ var DemoSearch = {
       title.setAttribute('data-dcp-s-text', '1');
       title.style.cssText = 'flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' +
         'font-size:15px;line-height:25px;color:' + p.text;
-      title.textContent = r.title || DCP.t('新对话');
+      this.setText(title, r.title || DCP.t('新对话'));
       var date = document.createElement('span');
       date.setAttribute('data-dcp-s-dim', '1');
       date.style.cssText = 'flex:0 0 auto;font-size:13px;line-height:20px;color:' + p.dim;
-      date.textContent = this.fmtDate(r.updatedAt);
+      this.setText(date, this.fmtDate(r.updatedAt));
       head.appendChild(title); head.appendChild(date);
       // 多命中会话显示「n/m」（官方实测：11px、dim 色、紧跟日期）
       if (r.m > 1) {
@@ -722,19 +1092,30 @@ var DemoSearch = {
     }.bind(this));
   },
 
-  /* ---------- 打开会话（按索引点侧边栏对应条目） ---------- */
-  // 侧边栏顺序 = sessionSummaries 按 updatedAt 降序，与搜索结果同序——
-  // 第 idx 个条目就是要找的会话（重复标题也不会开错）
-  openSession: function (idx) {
+  /* ---------- 打开会话（稳定 sid，不依赖侧栏排序） ---------- */
+  openSession: function (sid) {
     this.close();
-    var items = document.querySelectorAll('.item-ff6fc9');
-    var el = items[idx];
-    if (!el) return;
-    Utils.realClick(el);
+    if (!sid) return;
+    if (DCP.ui && typeof DCP.ui.stableNavigateToSession === 'function') {
+      DCP.ui.stableNavigateToSession(sid);
+      return;
+    }
+    var sync = DCP.modules && DCP.modules.sessionSync;
+    if (sync && typeof sync.openSessionById === 'function') {
+      Promise.resolve(sync.openSessionById(sid)).catch(function () {});
+      return;
+    }
+    // 最后兜底也只按稳定属性查找，不再用搜索结果索引点击侧栏。
+    var SEL = DCP.SEL || {};
+    var rows = SEL.sidebarItem ? document.querySelectorAll(SEL.sidebarItem) : [];
+    var hit = Array.prototype.find.call(rows, function (row) {
+      return (row.__dcpSessionId || row.getAttribute('data-dcp-session-id')) === sid;
+    });
+    if (hit) Utils.realClick(hit);
   },
 
-  /* ---------- 桥接中断轮恢复 ----------
-   * demo 的 IndexedDB 已完整保存 server_tool_use / tool_result / thinking，
+  /* ---------- 桥接中断响应恢复 ----------
+   * demo 的 IndexedDB 已完整保存 text / thinking / server_tool_use / tool_result，
    * 但官方下一次请求只带文本块。这里从同一份官方记录重建结构化 API 历史，
    * 不另建存储、不截断内容。 */
   requestText: function (m) {
@@ -743,6 +1124,23 @@ var DemoSearch = {
     if (!Array.isArray(m.content)) return '';
     return m.content.filter(function (b) { return b && b.type === 'text'; })
       .map(function (b) { return b.text || ''; }).join('\n');
+  },
+
+  // 首条消息发起时会话往往还没落盘，currentSession() 会先返回 null。用完整
+  // 请求前缀（所有 user/assistant 文本 + 附件特征）在 IndexedDB 中反查。
+  // 必须全库唯一：重复提示词、同附件多会话或只能匹配后缀时一律返回 null，
+  // 宁可放弃后台持久化，也不能把内容写进另一条会话。
+  findSessionByRequestMessages: async function (messages, startedAt) {
+    if (!Array.isArray(messages)) return null;
+    var body = messages.filter(function (m) { return m && (m.role === 'user' || m.role === 'assistant'); });
+    if (!body.length) return null;
+    var sessions = await this.readSessions();
+    var matches = sessions.filter(function (s) {
+      var chain = this.chain(s);
+      if (chain.length < body.length) return false;
+      return this.matchBodyPrefix(chain, body) === body.length;
+    }, this);
+    return matches.length === 1 ? matches[0] : null;
   },
 
   sessionRequestText: function (m) {
@@ -768,13 +1166,26 @@ var DemoSearch = {
   },
 
   hasBridgeBlocks: function (m) {
-    var types = { thinking: 1, text: 1, server_tool_use: 1, web_search_tool_result: 1, web_fetch_tool_result: 1 };
+    var types = this.dict();
+    types.thinking = 1; types.text = 1; types.server_tool_use = 1;
+    types.web_search_tool_result = 1; types.web_fetch_tool_result = 1;
     return !!(m && Array.isArray(m.blocks) && m.blocks.some(function (b) { return b && types[b.type]; }));
   },
 
   hasToolBlocks: function (m) {
     return !!(m && Array.isArray(m.blocks) && m.blocks.some(function (b) {
       return b && (b.type === 'server_tool_use' || b.type === 'web_search_tool_result' || b.type === 'web_fetch_tool_result');
+    }));
+  },
+
+  // 可继续的不只是工具轮：纯文本/思考在 max_tokens 或手动停止后同样需要
+  // 保留 assistant 前缀。搜索块也包含在内，供官网隐藏继续按钮时补入口。
+  hasRecoverableBlocks: function (m) {
+    return !!(m && Array.isArray(m.blocks) && m.blocks.some(function (b) {
+      if (!b) return false;
+      if (b.type === 'text') return !!String(b.text || '').trim();
+      if (b.type === 'thinking') return !!String(b.thinking || b.signature || '').trim();
+      return b.type === 'server_tool_use' || b.type === 'web_search_tool_result' || b.type === 'web_fetch_tool_result';
     }));
   },
 
@@ -808,7 +1219,9 @@ var DemoSearch = {
   },
 
   isRecoverableStatus: function (m) {
-    return !!(m && m.status && m.status !== 'done');
+    // 桥接把中途断流归一成 done + max_tokens；自然达到 max_tokens 的回答
+    // 也应按官网语义允许继续。done + end_turn 才是真正完成，不能恢复。
+    return !!(m && ((m.status && m.status !== 'done') || (m.status === 'done' && m.stopReason === 'max_tokens')));
   },
 
   resultBlockText: function (b) {
@@ -846,7 +1259,7 @@ var DemoSearch = {
    * 工具调用单独形成一对 assistant(tool_use)/user(tool_result)；未完成调用
    * 补一条明确结果，避免悬空 tool_use。所有文本原样保留。 */
   rebuildBridgeMessages: function (blocks) {
-    var out = [], pending = [], opened = {}, answered = {}, openOrder = [], legacy = 0;
+    var out = [], pending = [], opened = this.dict(), answered = this.dict(), openOrder = [], legacy = 0;
     var self = this;
     (blocks || []).forEach(function (b) {
       if (!b) return;
@@ -911,14 +1324,14 @@ var DemoSearch = {
       // 重新生成：官方请求停在该轮父 user，活跃链多出一条 assistant。
       if (chain.length === body.length + 1) {
         var extra = chain[body.length];
-        if (extra && extra.role === 'assistant' && this.hasToolBlocks(extra) && this.isRecoverableStatus(extra)) {
+        if (extra && extra.role === 'assistant' && this.hasRecoverableBlocks(extra) && this.isRecoverableStatus(extra)) {
           target = extra; mode = 'insert'; chainIndex = body.length;
         } else if (extra && extra.role === 'assistant') {
           // 点击重新生成时，demo 可能先插入一条空 assistant 占位；真正要恢复的是
-          // 同一父 user 下最近一条非 done 且含工具块的历史分支。
+          // 同一父 user 下最近一条可恢复的历史分支。
           var siblings = (session.messages || []).filter(function (m) {
             return m && m.role === 'assistant' && m.parentId === extra.parentId && m.id !== extra.id &&
-              this.hasToolBlocks(m) && this.isRecoverableStatus(m);
+              this.hasRecoverableBlocks(m) && this.isRecoverableStatus(m);
           }.bind(this)).sort(function (a, b) {
             // error 是真正异常中断、且最需要续接的分支；stopped 可能只是用户
             // 手动停止的旧版本。同类再按创建时间取最新。
@@ -933,7 +1346,7 @@ var DemoSearch = {
       if (!target && chain.length === body.length) {
         var last = chain[chain.length - 1];
         if (last && last.role === 'assistant' && body[body.length - 1].role === 'assistant' &&
-            this.hasToolBlocks(last) && this.isRecoverableStatus(last)) {
+            this.hasRecoverableBlocks(last) && this.isRecoverableStatus(last)) {
           target = last; mode = 'continue'; chainIndex = body.length - 1;
         }
       }
@@ -942,7 +1355,7 @@ var DemoSearch = {
         var tail = chain[chain.length - 1];
         if (tail && tail.role === 'user') {
           var parent = (session.messages || []).find(function (m) { return m.id === tail.parentId; });
-          if (parent && parent.role === 'assistant' && this.hasToolBlocks(parent) && this.isRecoverableStatus(parent)) {
+          if (parent && parent.role === 'assistant' && this.hasRecoverableBlocks(parent) && this.isRecoverableStatus(parent)) {
             target = parent; mode = 'replace'; chainIndex = chain.length - 2;
           }
         }
@@ -951,17 +1364,17 @@ var DemoSearch = {
 
     // 官方在“停止后直接发消息”时可能把中断轮及其父 user 整段从请求中跳过，
     // 前缀匹配因此失败。只在本会话内用最后一条 user 做锚点，沿会话树向上找
-    // 最近的含工具中断轮；遇到已完成轮次立即停止。
+    // 最近的含可恢复内容的中断响应；遇到真正完成的轮次立即停止。
     if (!target && body.length && body[body.length - 1].role === 'user') {
       var lastBodyUser = body[body.length - 1];
-      var byId = {};
+      var byId = this.dict();
       (session.messages || []).forEach(function (m) { byId[m.id] = m; });
       for (var li = chain.length - 1; li >= 0 && !target; li--) {
         if (chain[li].role !== 'user' || !this.shapeCompatible(chain[li], lastBodyUser, false)) continue;
         var cur = byId[chain[li].parentId], guard = 0;
         while (cur && guard++ < 8) {
           if (cur.role === 'assistant') {
-            if (this.hasToolBlocks(cur) && this.isRecoverableStatus(cur)) {
+            if (this.hasRecoverableBlocks(cur) && this.isRecoverableStatus(cur)) {
               var idx = chain.findIndex(function (m) { return m.id === cur.id; });
               if (idx > prefixLength) {
                 target = cur; mode = 'anchor'; chainIndex = idx;

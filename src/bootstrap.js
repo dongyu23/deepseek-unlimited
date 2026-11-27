@@ -4,64 +4,252 @@
 (function () {
 'use strict';
 
-/* ---------- 运行时探测：GM 可用用油猴，否则回退 localStorage（WebView 注入） ---------- */
-var HAS_GM = typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
-var LS_PREFIX = 'dcp_store_';
-var lsStore = {};
-try { lsStore = JSON.parse(localStorage.getItem('dcp_bridge_store') || '{}') || {}; } catch (e) { lsStore = {}; }
-var lsTimer = null;
-function lsWriteNow() { try { localStorage.setItem('dcp_bridge_store', JSON.stringify(lsStore)); } catch (e) {} }
-/* 合并写入：粘贴长文本时 input 会连续触发，逐次全量 stringify+写盘会卡死主线程 */
-function lsFlush() {
-  if (lsTimer) return;
-  lsTimer = setTimeout(function () { lsTimer = null; lsWriteNow(); }, 150);
+/* ---------- 基础安全工具 ---------- */
+function dict() { return Object.create(null); }
+function own(obj, key) { return !!obj && Object.prototype.hasOwnProperty.call(obj, key); }
+function blockedKey(key) { return key === '__proto__' || key === 'constructor' || key === 'prototype'; }
+
+// 生产日志只留诊断信息，不输出会话身份、Key 或完整对象。
+function redactText(value) {
+  return String(value == null ? '' : value)
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/gi, '$1[REDACTED]')
+    .replace(/((?:api[_-]?key|authorization|x-api-key)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .replace(/((?:session[_-]?id|target[_-]?id|request[_-]?id)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi, '[REDACTED_ID]')
+    .slice(0, 500);
 }
-function lsFlushNow() { if (lsTimer) { clearTimeout(lsTimer); lsTimer = null; } lsWriteNow(); }
-try {
-  window.addEventListener('pagehide', lsFlushNow);
-  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') lsFlushNow(); });
-} catch (e) {}
+function redactLog(value) {
+  if (value instanceof Error) return redactText(value.name + ': ' + value.message);
+  if (typeof value === 'string') return redactText(value);
+  try { return redactText(JSON.stringify(value)); }
+  catch (e) { return redactText(String(value)); }
+}
+
+/* ---------- 管理器能力探测 ----------
+ * GM storage 是隔离存储；localStorage 是页面可读存储，只能存非敏感配置。
+ * 如果只检测到半个 GM storage 接口，说明管理器集成不完整，此时不静默
+ * 降级到 localStorage，而是退到仅内存存储并明确报告能力缺失。 */
+var GM_GET = typeof GM_getValue === 'function';
+var GM_SET = typeof GM_setValue === 'function';
+var GM_DELETE = typeof GM_deleteValue === 'function';
+var GM_LIST = typeof GM_listValues === 'function';
+var GM_STYLE = typeof GM_addStyle === 'function';
+var HAS_GM = GM_GET && GM_SET;
+var GM_PARTIAL = (GM_GET || GM_SET) && !HAS_GM;
+
+var LS_PREFIX = 'dcp_store_';
+var LEGACY_LS_KEY = 'dcp_bridge_store';
+var legacyStore = dict();
+var memoryStore = dict();
+var lsAvailable = false;
+
+function readLegacyStore() {
+  var raw = null;
+  try { raw = localStorage.getItem(LEGACY_LS_KEY); } catch (e) { return; }
+  if (!raw) return;
+  try {
+    var parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    Object.keys(parsed).forEach(function (k) {
+      if (!blockedKey(k)) legacyStore[k] = parsed[k];
+    });
+  } catch (e) {}
+}
+function writeLegacyStore() {
+  var keys = Object.keys(legacyStore);
+  if (!keys.length) {
+    try { localStorage.removeItem(LEGACY_LS_KEY); } catch (e) {}
+    return;
+  }
+  localStorage.setItem(LEGACY_LS_KEY, JSON.stringify(legacyStore));
+}
+function detectLocalStorage() {
+  if (GM_PARTIAL) return false;
+  try {
+    if (typeof localStorage === 'undefined') return false;
+    var probe = LS_PREFIX + '__probe__';
+    localStorage.setItem(probe, '1');
+    localStorage.removeItem(probe);
+    readLegacyStore();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+lsAvailable = detectLocalStorage();
 
 var Bridge = {
+  capabilities: {
+    storage: HAS_GM ? 'manager' : (lsAvailable ? 'page' : 'memory'),
+    isolatedStorage: HAS_GM,
+    persistentStorage: HAS_GM || lsAvailable,
+    delete: HAS_GM ? GM_DELETE : true,
+    list: HAS_GM ? GM_LIST : true,
+    style: GM_STYLE ? 'manager' : 'dom',
+    degraded: GM_PARTIAL || (!HAS_GM && !lsAvailable)
+  },
+  lastError: null,
+  storageKey: function (k) {
+    return HAS_GM ? null : LS_PREFIX + encodeURIComponent(String(k));
+  },
+  _recordError: function (operation, error) {
+    this.lastError = { operation: operation, message: redactText(error && error.message || error) };
+    try {
+      if (typeof DCP !== 'undefined' && DCP.emit) {
+        DCP.emit('bridge:error', { operation: operation, message: this.lastError.message });
+      }
+    } catch (e) {}
+    return this.lastError;
+  },
+  _failure: function (operation, message) {
+    var err = new Error(message);
+    this._recordError(operation, err);
+    return { ok: false, persistent: false, error: message };
+  },
   get: function (k, d) {
-    if (HAS_GM) { var v = GM_getValue(k, undefined); return (v === undefined || v === null) ? d : v; }
-    return (k in lsStore) ? lsStore[k] : d;
+    try {
+      if (HAS_GM) {
+        var v = GM_getValue(k, undefined);
+        return (v === undefined || v === null) ? d : v;
+      }
+      if (lsAvailable) {
+        var raw = localStorage.getItem(this.storageKey(k));
+        if (raw !== null) {
+          try { return JSON.parse(raw); }
+          catch (e) { this._recordError('get', e); return d; }
+        }
+      }
+      if (own(legacyStore, k)) return legacyStore[k];
+      if (own(memoryStore, k)) return memoryStore[k];
+      return d;
+    } catch (e) {
+      this._recordError('get', e);
+      return d;
+    }
   },
   set: function (k, v) {
-    if (HAS_GM) return GM_setValue(k, v);
-    lsStore[k] = v; lsFlush();
+    try {
+      if (HAS_GM) {
+        GM_setValue(k, v);
+        return { ok: true, persistent: true, storage: 'manager' };
+      }
+      if (lsAvailable) {
+        localStorage.setItem(this.storageKey(k), JSON.stringify(v));
+        return { ok: true, persistent: true, storage: 'page' };
+      }
+      memoryStore[k] = v;
+      return { ok: true, persistent: false, storage: 'memory', degraded: this.capabilities.degraded };
+    } catch (e) {
+      this._recordError('set', e);
+      return { ok: false, persistent: false, error: redactText(e && e.message || e) };
+    }
   },
   remove: function (k) {
-    if (HAS_GM) { try { GM_deleteValue(k); } catch (e) {} return; }
-    delete lsStore[k]; lsFlush();
+    try {
+      if (HAS_GM) {
+        if (!GM_DELETE) return this._failure('remove', 'GM_deleteValue is unavailable');
+        GM_deleteValue(k);
+        return { ok: true };
+      }
+      if (lsAvailable) {
+        localStorage.removeItem(this.storageKey(k));
+        if (own(legacyStore, k)) {
+          delete legacyStore[k];
+          writeLegacyStore();
+        }
+        return { ok: true };
+      }
+      delete memoryStore[k];
+      return { ok: true, persistent: false };
+    } catch (e) {
+      this._recordError('remove', e);
+      return { ok: false, error: redactText(e && e.message || e) };
+    }
   },
   list: function () {
-    if (HAS_GM) { try { return GM_listValues() || []; } catch (e) { return []; } }
-    return Object.keys(lsStore);
+    try {
+      if (HAS_GM) {
+        if (!GM_LIST) return { ok: false, values: [], error: 'GM_listValues is unavailable' };
+        return { ok: true, values: GM_listValues() || [] };
+      }
+      var values = [];
+      var seen = dict();
+      if (lsAvailable) {
+        for (var i = 0; i < localStorage.length; i++) {
+          var storageKey = localStorage.key(i);
+          if (storageKey && storageKey.indexOf(LS_PREFIX) === 0) {
+            var name = storageKey.slice(LS_PREFIX.length);
+            try { name = decodeURIComponent(name); } catch (e) {}
+            if (!blockedKey(name) && !seen[name]) { seen[name] = true; values.push(name); }
+          }
+        }
+      }
+      Object.keys(legacyStore).forEach(function (k) {
+        if (!seen[k]) { seen[k] = true; values.push(k); }
+      });
+      Object.keys(memoryStore).forEach(function (k) {
+        if (!seen[k]) { seen[k] = true; values.push(k); }
+      });
+      return { ok: true, values: values };
+    } catch (e) {
+      this._recordError('list', e);
+      return { ok: false, values: [], error: redactText(e && e.message || e) };
+    }
   },
   _pendingCss: [],
   _flushScheduled: false,
   _mount: function (css) {
-    if (typeof GM_addStyle === 'function') { try { return GM_addStyle(css); } catch (e) {} }
+    if (GM_STYLE) {
+      try {
+        this.capabilities.style = 'manager';
+        return GM_addStyle(css);
+      } catch (e) {
+        this.capabilities.style = 'dom';
+        this.capabilities.styleFallback = true;
+        this._recordError('addStyle', e);
+      }
+    }
     var host = document.head || document.documentElement;
-    if (!host) { this._pendingCss.push(css); this._scheduleFlush(); return null; }
-    var s = document.createElement('style');
-    s.setAttribute('data-dcp', '1');
-    s.textContent = css;
-    host.appendChild(s);
-    return s;
+    if (!host) {
+      this.capabilities.style = 'pending';
+      this._pendingCss.push(css);
+      this._scheduleFlush();
+      return null;
+    }
+    try {
+      var s = document.createElement('style');
+      s.setAttribute('data-dcp', '1');
+      s.textContent = css;
+      host.appendChild(s);
+      this.capabilities.style = 'dom';
+      return s;
+    } catch (e) {
+      this.capabilities.style = 'unavailable';
+      this._recordError('addStyle', e);
+      return null;
+    }
   },
   _scheduleFlush: function () {
-    if (this._flushScheduled) return; this._flushScheduled = true;
+    if (this._flushScheduled) return;
+    this._flushScheduled = true;
     var self = this;
     var flush = function () {
       self._flushScheduled = false;
       var host = document.head || document.documentElement;
       if (!host) { self._scheduleFlush(); return; }
-      var all = self._pendingCss.slice(); self._pendingCss = [];
+      var all = self._pendingCss.slice();
+      self._pendingCss = [];
       all.forEach(function (css) {
-        var s = document.createElement('style');
-        s.setAttribute('data-dcp', '1'); s.textContent = css; host.appendChild(s);
+        try {
+          var s = document.createElement('style');
+          s.setAttribute('data-dcp', '1');
+          s.textContent = css;
+          host.appendChild(s);
+          self.capabilities.style = 'dom';
+        } catch (e) {
+          self.capabilities.style = 'unavailable';
+          self._recordError('addStyle', e);
+        }
       });
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', flush);
@@ -71,47 +259,41 @@ var Bridge = {
   hasGM: HAS_GM
 };
 
-/* ---------- 页面真正的 window ----------
- * 油猴带 @grant 时把脚本跑在沙箱里，沙箱的 window 不是页面的 window：读会沿
- * 原型链穿透过去，写只落在沙箱全局。于是 `window.fetch = 补丁` 这种写法页面
- * 一个字节都没换到——demo 页走 fetch，桥接整个不工作、圆圈永远 0（主站走
- * XHR、改的是共享原型所以照常，故只有 demo 页炸）。document.defaultView 在
- * 任何上下文里都指向页面真正的 window，unsafeWindow 是油猴的显式通道 */
+/* ---------- 页面真正的 window ---------- */
 function pageWindow() {
   try { if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow; } catch (e) {}
   try { if (document.defaultView) return document.defaultView; } catch (e) {}
   return window;
 }
 
-/* ---------- 全局命名空间 + 极简事件总线 ----------
- * DCP 只保留在 userscript 闭包内，绝不挂到页面真实 window：配置对象包含
- * demoKey，页面脚本一旦能读到 DCP，GM_* 的沙箱隔离就形同虚设。 */
+/* ---------- 全局命名空间 + 极简事件总线 ---------- */
 var DCP = {
   version: '8.5.0',
   runtime: HAS_GM ? 'tampermonkey' : 'inject',
   pageWindow: pageWindow,
   bridge: Bridge,
-  modules: {},
-  _ev: {},
-  on: function (name, fn) { (this._ev[name] || (this._ev[name] = [])).push(fn); },
+  modules: dict(),
+  _ev: dict(),
+  on: function (name, fn) {
+    if (!name || typeof fn !== 'function') return;
+    (this._ev[name] || (this._ev[name] = [])).push(fn);
+  },
   emit: function (name, payload) {
     var list = this._ev[name] || [];
-    for (var i = 0; i < list.length; i++) { try { list[i](payload); } catch (e) { console.error('[DCP]', name, e); } }
-  }
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](payload); }
+      catch (e) { console.error('[DCP]', redactText(name), redactLog(e)); }
+    }
+  },
+  redact: redactLog
 };
 
 DCP.register = function (name, api) { this.modules[name] = api || {}; };
 
-/* ---------- 基础变量 ----------
- * 占用环/进度条读 --dcp-accent 与 --dcp-border。这两个值以前是从另一个脚本
- * （deepseek-enhance）注入的 --dse-* 借来的——单独装本项目时没有人定义，
- * SVG 的 stroke 会变成无效值、环直接看不见。故自带一份，取值与官方主站同一
- * 组品牌色（浅色 #3b6cf6 / 深色 #6b93ff）。 */
+/* ---------- 基础变量 ---------- */
 Bridge.addStyle(
   ':root{--dcp-accent:#3b6cf6;--dcp-border:rgba(0,0,0,.08)}' +
   'body.dark{--dcp-accent:#6b93ff;--dcp-border:rgba(255,255,255,.10)}' +
-  /* Toast：保存成功/输入框无法识别这类轻反馈。以前也是从另一个脚本的样式表
-   * 借的，单独装时是个没有样式的裸 div，故一并自带 */
   '#dcp-toast{position:fixed;left:50%;top:max(20px,env(safe-area-inset-top));transform:translate(-50%,-160%);' +
   'z-index:2147483000;padding:10px 18px;border-radius:999px;font-size:13px;max-width:88vw;' +
   'background:rgba(28,30,38,.92);color:#fff;box-shadow:0 8px 30px rgba(0,0,0,.25);' +
@@ -119,6 +301,7 @@ Bridge.addStyle(
   '#dcp-toast.dcp-toast-show{transform:translate(-50%,0)}'
 );
 DCP.log = function () {
-  var a = ['[DCP]'].concat([].slice.call(arguments));
+  var a = ['[DCP]'];
+  for (var i = 0; i < arguments.length; i++) a.push(redactLog(arguments[i]));
   try { console.log.apply(console, a); } catch (e) {}
 };

@@ -26,7 +26,7 @@ var OfficialAnimations = {
   },
 
   sidebar: function () {
-    return document.querySelector((DCP.SEL || {}).sidebarRoot || '[class*="sider-"]');
+    return DCP.qs('sidebarRoot');
   },
 
   nativeClick: function (btn) {
@@ -38,9 +38,8 @@ var OfficialAnimations = {
     if (this._skip || !e.target || !e.target.closest) return;
     var btn = e.target.closest('button');
     if (!btn) return;
-    var label = (btn.getAttribute('aria-label') || '').trim();
-    var collapse = label === '收起边栏';
-    var expand = /展开侧栏|打开边栏/.test(label);
+    var collapse = UI.matchesLabel(btn, ['收起边栏', 'Collapse sidebar'], true);
+    var expand = UI.matchesLabel(btn, ['展开侧栏', '打开边栏', 'Expand sidebar', 'Open sidebar'], true);
     if (!collapse && !expand) return;
     e.preventDefault(); e.stopImmediatePropagation();
     if (this._busy) return;
@@ -97,17 +96,10 @@ var OfficialAnimations = {
   },
 
   waitForSidebar: function () {
-    var sel = (DCP.SEL || {}).sidebarRoot || '[class*="sider-"]';
-    var now = document.querySelector(sel);
+    var selector = 'sidebarRoot';
+    var now = DCP.qs(selector);
     if (now) return Promise.resolve(now);
-    return new Promise(function (resolve) {
-      var mo = new MutationObserver(function () {
-        var el = document.querySelector(sel);
-        if (el) { mo.disconnect(); clearTimeout(timer); resolve(el); }
-      });
-      mo.observe(document.body, { childList: true, subtree: true });
-      var timer = setTimeout(function () { mo.disconnect(); resolve(null); }, 900);
-    });
+    return UI.waitFor(function () { return DCP.qs(selector); }, { timeout: 900, interval: 50 });
   },
 
   restore: function (sider, old) {
@@ -229,7 +221,7 @@ var OfficialAnimations = {
   },
 
   pop: function (node) {
-    if (!node || node.__dcpOfficialMotion || node.classList.contains('dcp-preview-overlay')) return;
+    if (!node || UI.isOwned(node) || node.__dcpOfficialMotion || node.classList.contains('dcp-preview-overlay')) return;
     node.__dcpOfficialMotion = true;
     if (this.reduced() || typeof node.animate !== 'function') return;
     var isMenu = node.getAttribute('role') === 'menu';
@@ -250,7 +242,7 @@ var OfficialAnimations = {
   scanPop: function (root) {
     if (!root || root.nodeType !== 1) return;
     if (root.matches('[role="dialog"], [role="menu"]')) this.pop(root);
-    root.querySelectorAll('[role="dialog"], [role="menu"]').forEach(this.pop.bind(this));
+    DCP.qsa('[role="dialog"], [role="menu"]', root).forEach(this.pop.bind(this));
   },
 
   init: function () {
@@ -258,7 +250,7 @@ var OfficialAnimations = {
     Utils.onReady(function () {
       document.addEventListener('click', function (e) { self.onClick(e); }, true);
       self.scanPop(document.body);
-      self._observer = new MutationObserver(function (muts) {
+      self._observer = UI.observeRelevant(document.body, function (muts) {
         for (var i = 0; i < muts.length; i++) {
           for (var j = 0; j < muts[i].addedNodes.length; j++) self.scanPop(muts[i].addedNodes[j]);
           for (var r = 0; r < muts[i].removedNodes.length; r++) {
@@ -266,8 +258,7 @@ var OfficialAnimations = {
             if (gone && gone.nodeType === 1) delete gone.__dcpOfficialMotion;
           }
         }
-      });
-      self._observer.observe(document.body, { childList: true, subtree: true });
+      }, { childList: true, subtree: true });
     });
   }
 };

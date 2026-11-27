@@ -20,6 +20,10 @@ var SessionSync = {
   HEARTBEAT_MS: 5000,
   STALE_MS: 60000,
   RESTORE_GRACE_MS: 1200,
+  // 原生响应旁路读取不能无限占用 clone reader；空闲和总时长都有 deadline。
+  NATIVE_IDLE_TIMEOUT_MS: 45000,
+  NATIVE_OBSERVER_TIMEOUT_MS: 120000,
+  SESSION_REFRESH_TIMEOUT_MS: 2500,
 
   _enabled: false,
   _booted: false,
@@ -32,19 +36,19 @@ var SessionSync = {
   _rowTimer: null,
   _rowToken: 0,
   _heartbeat: null,
-  _generating: {},       // tabId:requestId -> { tabId, requestId, sid, state, at, lastSeen, title }
-  _done: {},             // sid -> { at, title, updatedAt }
+  _generating: Object.create(null), // tabId:requestId -> { tabId, requestId, sid, state, at, lastSeen, title }
+  _done: Object.create(null),        // sid -> { at, title, updatedAt }
   _summaries: [],
   _activeSid: null,
   _lastInteractionAt: Date.now(),
-  _remoteInteraction: {},
+  _remoteInteraction: Object.create(null),
   _seenBlur: false,
   _pendingRestore: null,
   _restoreStarted: false,
   _restoreTimer: null,
-  _reloadScheduled: {},
-  _reloadTimers: {},
-  _nativeRequests: {},
+  _reloadScheduled: Object.create(null),
+  _reloadTimers: Object.create(null),
+  _nativeRequests: Object.create(null),
   _styleInjected: false,
 
   enabled: function () {
@@ -57,9 +61,9 @@ var SessionSync = {
 
   ensureTabId: function () {
     if (this._tabId) return this._tabId;
-    var id = '';
-    try { id = this.pageWin().sessionStorage.getItem(this.TAB_KEY) || ''; } catch (e) {}
-    if (!id) id = 't_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    // 每个页面实例都必须是新的 tabId。sessionStorage 会随复制标签/会话恢复
+    // 一起被复制，复用它会让两个真实标签互相覆盖彼此的生成状态。
+    var id = 't_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
     this._tabId = id;
     try { this.pageWin().sessionStorage.setItem(this.TAB_KEY, id); } catch (e) {}
     return id;
@@ -263,34 +267,59 @@ var SessionSync = {
     if (!ctx) return null;
     var rec = { ctx: ctx, requestId: ctx.requestId, sid: null };
     this._nativeRequests[ctx.requestId] = rec;
-    this.onActivity({ requestId: ctx.requestId, sessionId: null, state: 'generating' });
+    this.onActivity({ requestId: ctx.requestId, sessionId: null, state: 'generating', epoch: ctx.epoch });
     var self = this;
     ctx.session.then(function (s) {
       if (!self._nativeRequests[ctx.requestId] || !s || !s.id) return;
       rec.sid = s.id;
-      self.onActivity({ requestId: ctx.requestId, sessionId: s.id, state: 'generating', title: s.title || '' });
+      self.onActivity({ requestId: ctx.requestId, sessionId: s.id, state: 'generating', title: s.title || '', epoch: ctx.epoch });
     }, function () {});
     return rec;
   },
 
   observeNativeResponse: function (resp, rec) {
     if (!resp || !rec) return resp;
-    var self = this, settled = false;
+    var self = this, settled = false, reader = null, sawEOF = false, observerTimer = null, idleTimer = null, readerCancelled = false;
+    var clearIdleTimer = function () {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    };
+    var cancelObserverReader = function () {
+      if (readerCancelled || sawEOF) return;
+      readerCancelled = true;
+      try { Utils.cancelReader(reader); } catch (e) {}
+    };
     var finish = function (state) {
       if (settled) return;
       settled = true;
+      if (observerTimer) { clearTimeout(observerTimer); observerTimer = null; }
+      clearIdleTimer();
+      cancelObserverReader();
       self.finishNativeRequest(rec, state);
     };
     if (!resp.ok) { finish('error'); return resp; }
     try {
       if (!resp.body || typeof resp.body.getReader !== 'function') { finish('done'); return resp; }
-      var reader = resp.clone().body.getReader();
+      reader = resp.clone().body.getReader();
       var dec = new TextDecoder(), buf = '', sawStop = false;
+      observerTimer = setTimeout(function () {
+        if (!settled) finish('stopped');
+      }, self.NATIVE_OBSERVER_TIMEOUT_MS);
       (async function () {
         try {
-          while (true) {
-            var r = await reader.read();
-            if (r.done) break;
+          while (!settled) {
+            var readPromise = new Promise(function (resolve, reject) {
+              idleTimer = setTimeout(function () {
+                idleTimer = null;
+                reject(Utils.timeoutError('native response idle timeout'));
+              }, self.NATIVE_IDLE_TIMEOUT_MS);
+              Promise.resolve(reader.read()).then(function (value) {
+                clearIdleTimer(); resolve(value);
+              }, function (error) {
+                clearIdleTimer(); reject(error);
+              });
+            });
+            var r = await readPromise;
+            if (r.done) { sawEOF = true; break; }
             buf += dec.decode(r.value, { stream: true });
             if (buf.length > 8192) buf = buf.slice(-8192);
             if (/event:\s*message_stop/i.test(buf) || /"type"\s*:\s*"message_stop"/.test(buf)) {
@@ -302,6 +331,9 @@ var SessionSync = {
         } catch (e) {
           finish('stopped');
         } finally {
+          if (observerTimer) { clearTimeout(observerTimer); observerTimer = null; }
+          clearIdleTimer();
+          cancelObserverReader();
           try { reader.releaseLock(); } catch (e) {}
         }
       })();
@@ -310,17 +342,22 @@ var SessionSync = {
   },
 
   finishNativeRequest: async function (rec, state) {
+    var self = this;
     if (!rec || !this._nativeRequests[rec.requestId]) return;
     delete this._nativeRequests[rec.requestId];
     var search = DCP.modules && DCP.modules.demoSearch;
     if (!rec.sid && search && typeof search.refreshRequestSession === 'function') {
       try {
-        var s = await search.refreshRequestSession(rec.ctx);
+        var s = await Utils.withTimeout(
+          search.refreshRequestSession(rec.ctx),
+          self.SESSION_REFRESH_TIMEOUT_MS,
+          'native session refresh timed out'
+        );
         if (s && s.id) rec.sid = s.id;
       } catch (e) {}
     }
     if (search && typeof search.finishRequest === 'function') search.finishRequest(rec.requestId);
-    this.onActivity({ requestId: rec.requestId, sessionId: rec.sid, state: state });
+    this.onActivity({ requestId: rec.requestId, sessionId: rec.sid, state: state, epoch: rec.ctx && rec.ctx.epoch });
   },
 
   /* ---------- 侧栏映射与状态节点 ---------- */
@@ -723,8 +760,12 @@ var SessionSync = {
       if (search && typeof search.finishRequest === 'function') search.finishRequest(id);
       delete self._nativeRequests[id];
     });
-    this._generating = {};
-    this._done = {};
+    this._generating = Object.create(null);
+    this._done = Object.create(null);
+    this._remoteInteraction = Object.create(null);
+    this._reloadScheduled = Object.create(null);
+    this._reloadTimers = Object.create(null);
+    this._nativeRequests = Object.create(null);
     var SEL = DCP.SEL || {};
     var rows = SEL.sidebarItem ? document.querySelectorAll(SEL.sidebarItem) : [];
     Array.prototype.forEach.call(rows, function (row) {

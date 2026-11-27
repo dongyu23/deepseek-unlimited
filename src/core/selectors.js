@@ -1,46 +1,337 @@
 /* ============================================================
- * core/selectors：实测选择器集中地（chat-demo 专用）
+ * core/selectors：chat-demo 选择器候选链与安全解析
  *
- * 只保留 chat-demo（cdn.deepseek.com/chat-demo）用到的：消息行、输入区、
- * 侧边栏会话条目、聊天区标题。demo 页是独立构建、class 全是构建哈希
- * （message-e1faee / bubble-_4cfe7 / scroll-_7ccaf / item-ff6fc9 /
- * view-_5fa77 / header-_5fa77 / title-_5fa77 / top-ac14ac 等），官方
- * 重建后这些哈希会变——届时只需更新下面这一组。
+ * demo 页的 class 含构建哈希。这里同时保留稳定设计 token、结构属性和
+ * 中英文原生 label 作为候选；业务模块统一通过 DCP.qs/qsa/closest 解析，
+ * 单个候选失效时不会拖垮整条链。
  * ============================================================ */
-var SEL = {
-  // 输入区（与主站共用的稳定设计 token）
-  textarea: 'textarea._27c9245, textarea',
-  inputToolbar: '.ec4f5d61',
+var SELECTOR_CANDIDATES = {
+  // 输入区
+  textarea: [
+    'textarea._27c9245:not([aria-label="编辑消息"]):not([aria-label="Edit message"])',
+    'textarea:not([aria-label="编辑消息"]):not([aria-label="Edit message"])'
+  ],
+  inputToolbar: [
+    '.ec4f5d61',
+    '[data-dcp-toolbar]',
+    '[class*="inputToolbar-"]',
+    '[class*="input-toolbar-"]'
+  ],
+  msgEditor: [
+    'textarea[aria-label="编辑消息"]',
+    'textarea[aria-label="Edit message"]'
+  ],
 
-  /* ---- cdn.deepseek.com/chat-demo ----
-   * 消息区复用 ds-markdown / ds-think-content / md-code-block 等稳定设计 token；
-   * 页面骨架与消息行类名全是构建哈希。demo 无虚拟列表：消息在普通滚动容器
-   * .scroll-_7ccaf 内顺序渲染；用户消息行与 AI 消息底部容器复用同一 CSS 模块
-   * （container-_4cfe7），取消息行会重复命中，故用户行改用气泡类 bubble-_4cfe7。 */
-  virtualList: '.scroll-_7ccaf',
-  msg: '.message-e1faee, .bubble-_4cfe7',
-  msgRowAi: '.message-e1faee',
-  msgRowUser: '.bubble-_4cfe7',
-  userBubble: '.bubble-_4cfe7',
-  aiMarkdownAny: '.ds-markdown',
-  aiActionBar: '.actions-_4cfe7',
-  thinkBlock: '.area-_3d93a',
-  thinkHeader: '.title-_3d93a',
-  // 侧边栏（收起边栏时条目会整个从 DOM 消失，不能作为常驻数据源）
-  appTop: '.top-ac14ac',
-  sidebarItem: '.item-ff6fc9',
-  sidebarItemActive: '.item-ff6fc9.active-ff6fc9',
-  sidebarItemTitle: '.title-ff6fc9',
-  sidebarList: '.section-ac14ac',
-  sidebarRoot: '[class*="sider-"]',
-  sidebarListWrap: '[class*="listWrap-"]',
-  sidebarCollapseBtn: 'button[aria-label="收起边栏"]',
-  sidebarExpandBtn: 'button[aria-label="打开边栏"], button[aria-label="展开侧栏"]',
-  // 聊天区标题：demo 页自己渲染的当前会话名（新对话时整个元素不存在）
-  chatView: '.view-_5fa77',
-  chatHeader: '.header-_5fa77',
-  chatTitle: '.title-_5fa77',
-  // demo 是客户端直连 api.deepseek.com：无服务端会话 id、无 history_messages 接口
-  noServerSession: true
+  // 消息区
+  virtualList: [
+    '.scroll-_7ccaf',
+    '[data-dcp-virtual-list]'
+  ],
+  msg: [
+    '.message-e1faee',
+    '.bubble-_4cfe7',
+    '[data-dcp-message-row]'
+  ],
+  msgRowAi: [
+    '.message-e1faee',
+    '[data-dcp-ai-row]'
+  ],
+  msgRowUser: [
+    '.bubble-_4cfe7',
+    '[data-dcp-user-row]'
+  ],
+  userBubble: [
+    '.bubble-_4cfe7',
+    '[data-dcp-user-bubble]'
+  ],
+  aiMarkdownAny: [
+    '.ds-markdown',
+    '[data-dcp-ai-markdown]'
+  ],
+  aiActionBar: [
+    '[class*="actions-"]',
+    '[data-dcp-ai-actions]'
+  ],
+  thinkBlock: [
+    '.area-_3d93a',
+    '[data-dcp-think-block]'
+  ],
+  thinkHeader: [
+    '.title-_3d93a',
+    '[data-dcp-think-header]'
+  ],
+
+  // 侧边栏与当前会话
+  appTop: [
+    '.top-ac14ac',
+    '[data-dcp-app-top]'
+  ],
+  sidebarItem: [
+    '.item-ff6fc9',
+    '[data-dcp-session-id][role="button"]',
+    '[data-dcp-session-id][tabindex]'
+  ],
+  sidebarItemActive: [
+    '.item-ff6fc9.active-ff6fc9',
+    '.item-ff6fc9[aria-current="page"]',
+    '[data-dcp-session-id][aria-current="page"]',
+    '[data-dcp-session-id].active'
+  ],
+  sidebarItemTitle: [
+    '.title-ff6fc9',
+    '[data-dcp-session-title]'
+  ],
+  sidebarList: [
+    '.section-ac14ac',
+    '[data-dcp-sidebar-list]'
+  ],
+  sidebarRoot: [
+    '[class*="sider-"]',
+    '[data-dcp-sidebar]'
+  ],
+  sidebarListWrap: [
+    '[class*="listWrap-"]',
+    '[data-dcp-sidebar-list-wrap]'
+  ],
+  sidebarCollapseBtn: [
+    'button[aria-label="收起边栏"]',
+    'button[aria-label="Collapse sidebar" i]',
+    'button[title="Collapse sidebar" i]',
+    'button[data-dcp-sidebar-collapse]'
+  ],
+  sidebarExpandBtn: [
+    'button[aria-label="打开边栏"]',
+    'button[aria-label="展开侧栏"]',
+    'button[aria-label="Open sidebar" i]',
+    'button[aria-label="Expand sidebar" i]',
+    'button[title="Open sidebar" i]',
+    'button[title="Expand sidebar" i]',
+    'button[data-dcp-sidebar-expand]'
+  ],
+  newChatButton: [
+    'button[aria-label="开启新对话"]',
+    'button[aria-label="New chat" i]',
+    'button[aria-label="New conversation" i]',
+    'button[data-dcp-new-chat]'
+  ],
+  chatView: [
+    '.view-_5fa77',
+    '[data-dcp-chat-view]'
+  ],
+  chatHeader: [
+    '.header-_5fa77',
+    '[data-dcp-chat-header]'
+  ],
+  chatTitle: [
+    '.title-_5fa77',
+    '[data-dcp-chat-title]'
+  ],
+
+  // 搜索（供搜索模块复用；当前 demo 搜索节点仍以 #id 为主）
+  searchEntry: [
+    '#dcp-search-entry',
+    'button[aria-label="搜索对话内容..."]',
+    'button[aria-label="搜索对话内容"]',
+    'button[aria-label="Search conversations" i]',
+    'button[aria-label="Search chats" i]',
+    'button[title="Search conversations" i]',
+    'button[data-dcp-search-entry]'
+  ],
+  searchOverlay: [
+    '#dcp-search-mask',
+    '[data-dcp-search-overlay]'
+  ],
+  searchDialog: [
+    '#dcp-search-modal',
+    '[data-dcp-search-dialog]'
+  ],
+  searchInput: [
+    '#dcp-search-input',
+    '[data-dcp-search-input]',
+    '#dcp-search-modal input[type="text"]'
+  ],
+  searchList: [
+    '#dcp-search-list',
+    '[data-dcp-search-list]'
+  ],
+  searchResult: [
+    '[data-dcp-search-result]',
+    '#dcp-search-list [role="option"]'
+  ],
+
+  // 设置与代码块
+  settingsButton: [
+    'button[aria-label="设置"]',
+    'button[aria-label="Settings" i]',
+    'button[title="Settings" i]',
+    '[data-dcp-settings-button]'
+  ],
+  codeBlock: [
+    '.md-code-block',
+    '[data-dcp-code-block]'
+  ],
+  codeBanner: [
+    '.md-code-block-banner',
+    '[class*="code-block-banner-"]',
+    '[data-dcp-code-banner]'
+  ],
+  copyButton: [
+    'button[aria-label="复制"]',
+    'button[aria-label="Copy" i]',
+    'button[aria-label="Copy code" i]',
+    'button[title="Copy" i]'
+  ],
+  continueButton: [
+    '[class*="continueButton-"]',
+    '[data-dcp-continue-template]'
+  ],
+  menu: [
+    '[role="menu"]'
+  ],
+  menuItem: [
+    '[role="menuitem"]'
+  ],
+  pinMenuItem: [
+    '.dcp-pin-item'
+  ],
+  fileCard: [
+    '[class*="card-"]',
+    '[data-dcp-file-card]'
+  ],
+  previewOverlay: [
+    '.dcp-preview-overlay',
+    '[data-dcp-preview-overlay]'
+  ],
+  sendButton: [
+    'button[aria-label="发送"]',
+    'button[aria-label="Send" i]',
+    'button[data-dcp-send]'
+  ],
+  stopGenerateButton: [
+    'button[aria-label="停止生成"]',
+    'button[aria-label="Stop generating" i]',
+    'button[aria-label="Stop" i]',
+    'button[data-dcp-stop-generate]'
+  ]
 };
+
+function selectorChain(input) {
+  if (Array.isArray(input)) return input;
+  if (typeof input !== 'string' || !input) return [];
+  if (Object.prototype.hasOwnProperty.call(SELECTOR_CANDIDATES, input)) {
+    return SELECTOR_CANDIDATES[input];
+  }
+  return [input];
+}
+
+function selectorRoot(first, second) {
+  if (first && typeof first === 'object' &&
+      (first.nodeType === 1 || first.nodeType === 9 || first.nodeType === 11)) {
+    return { root: first, selector: second };
+  }
+  return { root: second || (typeof document !== 'undefined' ? document : null), selector: first };
+}
+
+function safeQsa(first, second) {
+  var args = selectorRoot(first, second);
+  var root = args.root;
+  if (!root || typeof root.querySelectorAll !== 'function') return [];
+  var selectors = selectorChain(args.selector);
+  var out = [];
+  var seen = new Set();
+  for (var i = 0; i < selectors.length; i++) {
+    var selector = selectors[i];
+    if (typeof selector !== 'string' || !selector) continue;
+    var list;
+    try { list = root.querySelectorAll(selector); } catch (e) { continue; }
+    for (var j = 0; j < list.length; j++) {
+      var el = list[j];
+      if (!el || seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+  }
+  if (out.length > 1 && root.nodeType === 1 && root.compareDocumentPosition) {
+    out.sort(function (a, b) {
+      var position = a.compareDocumentPosition(b);
+      if (position & 4) return -1;
+      if (position & 2) return 1;
+      return 0;
+    });
+  }
+  return out;
+}
+
+function safeQs(first, second) {
+  var list = safeQsa(first, second);
+  return list.length ? list[0] : null;
+}
+
+function safeClosest(element, selector) {
+  if (!element || element.nodeType !== 1) return null;
+  var selectors = selectorChain(selector);
+  var node = element;
+  while (node && node.nodeType === 1) {
+    for (var i = 0; i < selectors.length; i++) {
+      try {
+        if (node.matches && node.matches(selectors[i])) return node;
+      } catch (e) {}
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function safeMatches(element, selector) {
+  return !!(element && element.nodeType === 1 && safeClosest(element, selector) === element);
+}
+
+var SEL = {};
+Object.keys(SELECTOR_CANDIDATES).forEach(function (key) {
+  // 兼容旧模块直接把 SEL.xxx 传给 querySelector/matches 的用法。
+  SEL[key] = SELECTOR_CANDIDATES[key].join(', ');
+});
+SEL.noServerSession = true;
+
+var _warnedSelectors = new Set();
+function warnSelector(key, selector) {
+  var id = key || String(selector || '');
+  if (_warnedSelectors.has(id)) return;
+  _warnedSelectors.add(id);
+  var message = '[DCP] selector not found: ' + id;
+  try { if (typeof console !== 'undefined' && console.warn) console.warn(message); } catch (e) {}
+  try { DCP.emit('selectors:warning', { key: key, selector: selector }); } catch (e) {}
+}
+
+function selectorHealth(required) {
+  var keys = Array.isArray(required) ? required : ['textarea', 'msgRowAi', 'sidebarItem', 'chatTitle'];
+  var report = Object.create(null);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    report[key] = !!safeQs(key);
+  }
+  return report;
+}
+
+function checkSelectorHealth(required) {
+  var keys = Array.isArray(required) ? required : ['textarea', 'msgRowAi', 'sidebarItem', 'chatTitle'];
+  var report = selectorHealth(keys);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    if (!report[key]) warnSelector(key, SELECTOR_CANDIDATES[key] || key);
+  }
+  try { DCP.emit('selectors:health', report); } catch (e) {}
+  return report;
+}
+
 DCP.SEL = SEL;
+DCP.SELECTORS = SEL;
+DCP.selectorCandidates = SELECTOR_CANDIDATES;
+DCP.qs = safeQs;
+DCP.qsa = safeQsa;
+DCP.closest = safeClosest;
+DCP.matches = safeMatches;
+DCP.selectorHealth = selectorHealth;
+DCP.checkSelectorHealth = checkSelectorHealth;
+DCP.warnSelector = warnSelector;
+try { DCP.register('selectors', SEL); } catch (e) {}

@@ -9,10 +9,13 @@ var Utils = {
     return m ? m[1] : '';
   },
   debounce: function (fn, d) {
-    var t; return function () {
+    var t;
+    var wrapped = function () {
       var a = arguments, c = this; clearTimeout(t);
       t = setTimeout(function () { fn.apply(c, a); }, d);
     };
+    wrapped.cancel = function () { clearTimeout(t); t = null; };
+    return wrapped;
   },
   throttle: function (fn, d) {
     var last = 0, timer;
@@ -48,6 +51,51 @@ var Utils = {
       })();
     });
   },
+  dict: function () { return Object.create(null); },
+  own: function (obj, key) { return !!obj && Object.prototype.hasOwnProperty.call(obj, key); },
+  setTextIfChanged: function (el, text) {
+    if (!el) return false;
+    text = String(text == null ? '' : text);
+    if (el.textContent === text) return false;
+    el.textContent = text;
+    return true;
+  },
+  isAbortError: function (e) {
+    return !!(e && (e.name === 'AbortError' || e.code === 20));
+  },
+  timeoutError: function (message) {
+    var e = new Error(message || 'operation timed out');
+    e.name = 'TimeoutError';
+    return e;
+  },
+  withTimeout: function (promise, ms, message) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        reject(Utils.timeoutError(message));
+      }, ms);
+      Promise.resolve(promise).then(function (v) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); reject(e);
+      });
+    });
+  },
+  cancelReader: function (reader) {
+    if (!reader || typeof reader.cancel !== 'function') return Promise.resolve(false);
+    try { return Promise.resolve(reader.cancel()).then(function () { return true; }, function () { return false; }); }
+    catch (e) { return Promise.resolve(false); }
+  },
+  redact: function (value) {
+    var s = String(value == null ? '' : value);
+    s = s.replace(/(Bearer\s+)[A-Za-z0-9._~+\/=-]+/gi, '$1[REDACTED]');
+    s = s.replace(/((?:api[_-]?key|authorization|x-api-key)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]');
+    return s.slice(0, 500);
+  },
   estimateTokens: function (text) {
     if (!text) return 0;
     var cn = (text.match(/[一-鿿]/g) || []).length;
@@ -70,6 +118,9 @@ var Utils = {
     var t = document.getElementById('dcp-toast');
     if (!t) {
       t = document.createElement('div'); t.id = 'dcp-toast';
+      t.setAttribute('role', 'status');
+      t.setAttribute('aria-live', 'polite');
+      t.setAttribute('aria-atomic', 'true');
       document.body.appendChild(t);
     }
     t.textContent = msg;

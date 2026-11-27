@@ -27,15 +27,20 @@
  *     代码注释与交付说明——解耦需要客户端 agent 桥接，未做。
  * ============================================================ */
 var DemoApi = {
-  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', sessionSync: 'demoSessionSync', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource' },
+  KEYS: { endpoint: 'demoEndpoint', key: 'demoKey', model: 'demoModel', multimodal: 'demoMultimodal', bridge: 'demoBridge', ctxLimit: 'demoCtxLimit', showCtxRing: 'demoShowCtxRing', showTps: 'demoShowTps', sessionSync: 'demoSessionSync', searchLimit: 'demoSearchLimit', toolMode: 'demoToolMode', titleSource: 'demoTitleSource', lang: 'lang' },
   DEFAULT_BASE: 'https://api.deepseek.com/anthropic/v1',
-  // 只有精确官方域名才允许回退使用页面里的官方 Key；避免
-  // https://deepseek.com.example/... 这类地址被正则误判为官方端点。
+  OFFICIAL_ORIGINS: ['https://api.deepseek.com', 'https://cdn.deepseek.com'],
+  OFFICIAL_MESSAGES_PATH: '/anthropic/v1/messages',
+  OFFICIAL_FILES_PATH: '/anthropic/v1/files',
+  TEST_TIMEOUT_MS: 30000,
+  // 只有精确官方端点才允许回退使用页面里的官方 Key。
   isOfficialEndpoint: function (ep) {
     var raw = String(ep || this.DEFAULT_BASE).trim();
     try {
       var u = new URL(raw);
-      return u.protocol === 'https:' && u.hostname.toLowerCase() === 'api.deepseek.com';
+      return u.protocol === 'https:' && u.origin === this.OFFICIAL_ORIGIN &&
+        !u.username && !u.password && !u.search && !u.hash &&
+        /^\/anthropic\/v1(?:\/messages)?\/?$/.test(u.pathname);
     } catch (e) {
       return false;
     }
@@ -43,62 +48,319 @@ var DemoApi = {
   // 模型输入建议（datalist），不限制手输
   HINTS: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-flash'],
 
-  /* ---------- 附件正文捕获（file_id → 文本） ----------
+  /* ---------- 附件捕获与有界 LRU 缓存 ----------
    * 页面把文件 POST 到 /anthropic/v1/files，响应只回 {id,size_bytes,filename,
-   * mime_type}——没有正文。而 DeepSeek 明确不支持下载：GET .../files/{id} 只回
-   * 元数据、GET .../files/{id}/content 404（官方文档原话「上传的原始文件和解析
-   * 结果都不支持下载」）。所以对话请求里的 document/file_id 块**只有 DeepSeek
-   * 自己的模型认**，第三方模型收到就是死引用（StepFun 直接 400 input_invalid，
-   * 且该 400 不带 CORS 头，浏览器只报 Failed to fetch）。
-   * 但上传请求本身就经过这里，FormData 里躺着真正的 File——趁上传时把正文按
-   * file_id 记下来，桥接再内联成文本块，附件就能在自定义模型下用了。
+   * mime_type}——没有正文。DeepSeek 自己的 Files API 也不支持下载原文件，所以
+   * 第三方模型需要的正文只能在上传时从 FormData 里留下来。
    *
-   * 只收文本类文件，**不设长度上限**：PDF/图片/Office 的字节按 UTF-8 解出来
-   * 是乱码，硬塞给模型比给一行说明更糟，这是能力边界；而长度不该由我们截—
-   * —模型上下文装不下时接口会直接报错，那是诚实失败，静默截断反而会让模型
-   * 拿半份内容作答、还看不出少了什么（上下文圆圈会如实显示占用爆掉）。 */
-  _fileTexts: {},
+   * 每条记录都有 ready promise、大小、LRU 时间、截断与错误状态。文本只读前
+   * 1 MiB，图片最多 8 MiB；总缓存限制 64 条 / 32 MiB，超限按 LRU 逐出。
+   * 自定义模式关闭时不解析 FormData、不建立缓存，官方原生路径零额外开销。 */
+  FILE_TEXT_MAX_BYTES: 1024 * 1024,
+  FILE_IMAGE_MAX_BYTES: 8 * 1024 * 1024,
+  FILE_CACHE_MAX_ENTRIES: 64,
+  FILE_CACHE_MAX_BYTES: 32 * 1024 * 1024,
+  FILE_WAIT_TIMEOUT_MS: 8000,
+  _fileTexts: Object.create(null),
+  _fileBytes: 0,
+  _fileSeq: 0,
   _textExtRe: /\.(txt|md|csv|tsv|json|log|ya?ml|yml|ini|conf|cfg|html?|css|js|mjs|cjs|ts|tsx|jsx|py|go|java|c|cc|cpp|cxx|h|hpp|rs|rb|sh|bash|zsh|sql|xml|toml|dot|gv|proto|tex|bib|sty|cls|lisp|el|vim|r|lua|pl|pm|php|ps1|bat|cmd|awk|sed|make|mk|cmake|gradle|sbt|scala|kt|kts|swift|m|mm|dart|erl|hrl|ex|exs|clj|hs|lhs|ml|mli|fs|fsi|fsx|nim|cr|d|zig|v|sv|vhd|asm|s)$/i,
 
-  captureFile: function (orig, selfArg, url, init) {
-    var file = null, name = '', type = '';
-    try {
-      var b = init && init.body;
-      if (b && typeof FormData !== 'undefined' && b instanceof FormData) {
-        file = b.get('file');
-        if (file) { name = file.name || ''; type = file.type || ''; }
+  _shouldCacheFiles: function () {
+    return !!DCP.config.get('demoCustom');
+  },
+  _touchFileRecord: function (rec) {
+    if (!rec) return;
+    rec.lastUsed = Date.now();
+    rec.usedSeq = ++this._fileSeq;
+  },
+  _evictFileRecord: function (id) {
+    var rec = this._fileTexts[id];
+    if (!rec) return;
+    rec.evicted = true;
+    rec.cached = false;
+    this._fileBytes -= rec.weightBytes || 0;
+    if (this._fileBytes < 0) this._fileBytes = 0;
+    delete this._fileTexts[id];
+    if (!rec._readyDone) {
+      rec.error = 'evicted';
+      this._finishFileRead(rec);
+    }
+  },
+  _enforceFileLimits: function () {
+    while (Object.keys(this._fileTexts).length > this.FILE_CACHE_MAX_ENTRIES ||
+           this._fileBytes > this.FILE_CACHE_MAX_BYTES) {
+      var oldestId = null;
+      var oldest = null;
+      Object.keys(this._fileTexts).forEach(function (id) {
+        var rec = this._fileTexts[id];
+        if (!oldest || rec.usedSeq < oldest.usedSeq ||
+            (rec.usedSeq === oldest.usedSeq && rec.lastUsed < oldest.lastUsed)) {
+          oldest = rec;
+          oldestId = id;
+        }
+      }, this);
+      if (oldestId == null) break;
+      this._evictFileRecord(oldestId);
+    }
+  },
+  _cacheFileRecord: function (rec) {
+    if (!rec || !rec.id) return;
+    if (this._fileTexts[rec.id]) this._evictFileRecord(rec.id);
+    this._fileTexts[rec.id] = rec;
+    this._fileBytes += rec.weightBytes || 0;
+    this._touchFileRecord(rec);
+    this._enforceFileLimits();
+  },
+  clearFileCache: function () {
+    var self = this;
+    Object.keys(this._fileTexts).forEach(function (id) {
+      var rec = self._fileTexts[id];
+      if (rec) {
+        rec.evicted = true;
+        rec.cached = false;
+        if (!rec._readyDone) {
+          rec.error = 'cache_cleared';
+          self._finishFileRead(rec);
+        }
       }
-    } catch (e) {}
-    if (!file) return orig.call(selfArg, url, init);
-    return orig.call(selfArg, url, init).then(function (resp) {
-      var bind = function (id) {
-        if (!id) return;
-        var rec = { name: name, type: type };
-        DemoApi._fileTexts[id] = rec;
-        // 只在开着自定义模型时值得存（官方端点下 document/image 块原生可用）
-        if (!DCP.config.get('demoCustom')) return;
-        var looksText = /^text\//.test(type) || DemoApi._textExtRe.test(name);
-        if (looksText) {
-          file.text().then(function (tx) { rec.text = tx; }).catch(function () {});
-          return;
-        }
-        // 多模态：图片按 base64 存下来。第三方端点不认 DeepSeek 的 file 引用
-        // （实测 StepFun 报 messages[0].content[0].source.type must be url or
-        // base64），而 DeepSeek 自己的 Files API 又不支持下载原文件——唯一能
-        // 把图片送到第三方模型的办法就是本地读成 base64 内联
-        if (/^image\//.test(type)) {
-          try {
-            var reader = new FileReader();
-            reader.onload = function () { rec.dataUrl = String(reader.result || ''); };
-            reader.onerror = function () { rec.dataUrl = ''; };
-            reader.readAsDataURL(file);
-          } catch (e) {}
-        }
+      delete self._fileTexts[id];
+    });
+    this._fileBytes = 0;
+  },
+  _finishFileRead: function (rec, error) {
+    if (!rec || rec._readyDone) return;
+    rec._readyDone = true;
+    if (error && rec.error !== 'timeout') rec.error = error;
+    if (!error && rec.error === 'timeout') rec.error = null;
+    try { rec._resolveReady(rec); } catch (e) {}
+  },
+  _readBlobText: function (blob) {
+    if (blob && typeof blob.text === 'function') return blob.text();
+    return new Promise(function (resolve, reject) {
+      if (typeof FileReader === 'undefined') { reject(new Error('FileReader unavailable')); return; }
+      var reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result || '')); };
+      reader.onerror = function () { reject(reader.error || new Error('read failed')); };
+      try { reader.readAsText(blob); } catch (e) { reject(e); }
+    });
+  },
+  _readTextFile: function (rec, file) {
+    var self = this;
+    var cap = this.FILE_TEXT_MAX_BYTES;
+    rec.truncated = rec.size > cap;
+    var source = file;
+    if (rec.truncated) {
+      if (!file || typeof file.slice !== 'function') {
+        rec.error = 'bounded_read_unavailable';
+        self._finishFileRead(rec);
+        return;
+      }
+      source = file.slice(0, cap);
+    } else if (!file || (typeof file.text !== 'function' && typeof file.slice !== 'function')) {
+      rec.error = 'text_reader_unavailable';
+      self._finishFileRead(rec);
+      return;
+    }
+    try {
+      Promise.resolve(self._readBlobText(source)).then(function (text) {
+        rec.text = String(text == null ? '' : text);
+        self._finishFileRead(rec);
+      }, function () {
+        rec.error = 'text_read_failed';
+        rec.text = undefined;
+        self._finishFileRead(rec);
+      });
+    } catch (e) {
+      rec.error = 'text_read_failed';
+      rec.text = undefined;
+      self._finishFileRead(rec);
+    }
+  },
+  _readImageFile: function (rec, file) {
+    var self = this;
+    if (rec.size > this.FILE_IMAGE_MAX_BYTES) {
+      rec.error = 'image_too_large';
+      self._finishFileRead(rec);
+      return;
+    }
+    if (typeof FileReader === 'undefined') {
+      rec.error = 'image_reader_unavailable';
+      self._finishFileRead(rec);
+      return;
+    }
+    try {
+      var reader = new FileReader();
+      reader.onload = function () {
+        rec.dataUrl = String(reader.result || '');
+        var match = rec.dataUrl.match(/^data:([^;]+);base64,/i);
+        rec.mediaType = (match && match[1]) || file.type || '';
+        self._finishFileRead(rec);
       };
-      try {
-        resp.clone().json().then(function (j) { bind(j && j.id); }, function () {});
-      } catch (e) {}
-      return resp;
+      reader.onerror = function () {
+        rec.error = 'image_read_failed';
+        rec.dataUrl = undefined;
+        self._finishFileRead(rec);
+      };
+      reader.onabort = function () {
+        rec.error = 'image_read_aborted';
+        rec.dataUrl = undefined;
+        self._finishFileRead(rec);
+      };
+      reader.readAsDataURL(file);
+    } catch (e) {
+      rec.error = 'image_read_failed';
+      rec.dataUrl = undefined;
+      self._finishFileRead(rec);
+    }
+  },
+  _createFileRecord: function (id, file, meta) {
+    if (!id || !this._shouldCacheFiles()) return null;
+    id = String(id);
+    meta = meta && typeof meta === 'object' ? meta : {};
+    var name = String(meta.filename || (file && file.name) || '');
+    var type = String(meta.mime_type || (file && file.type) || '');
+    var size = Number(meta.size_bytes);
+    var fileSize = Number(file && file.size) || 0;
+    if (!isFinite(size) || size < 0) size = fileSize;
+    else size = Math.max(size, fileSize);
+    var rec = {
+      id: id,
+      name: name,
+      type: type,
+      size: size,
+      lastUsed: 0,
+      usedSeq: 0,
+      truncated: false,
+      error: null,
+      timedOut: false,
+      skipped: false,
+      text: undefined,
+      dataUrl: undefined,
+      mediaType: type,
+      weightBytes: 0,
+      cached: true,
+      evicted: false,
+      ready: null,
+      _readyDone: false,
+      _resolveReady: null
+    };
+    rec.ready = new Promise(function (resolve) { rec._resolveReady = resolve; });
+    var looksText = /^text\//.test(type) || this._textExtRe.test(name);
+    var looksImage = /^image\//.test(type);
+    if (looksText) rec.weightBytes = Math.min(size, this.FILE_TEXT_MAX_BYTES);
+    else if (looksImage && DCP.config.get('demoMultimodal')) rec.weightBytes = Math.min(size, this.FILE_IMAGE_MAX_BYTES);
+    this._cacheFileRecord(rec);
+    if (rec.evicted) {
+      rec.error = 'evicted';
+      this._finishFileRead(rec);
+      return rec;
+    }
+    if (looksText) this._readTextFile(rec, file);
+    else if (looksImage) {
+      if (!DCP.config.get('demoMultimodal')) {
+        rec.skipped = true;
+        this._finishFileRead(rec);
+      } else this._readImageFile(rec, file);
+    } else this._finishFileRead(rec);
+    return rec;
+  },
+  _missingFileRecord: function (id) {
+    var rec = {
+      id: id, name: '', type: '', size: 0, lastUsed: Date.now(), usedSeq: 0,
+      truncated: false, error: 'not_found', timedOut: false, skipped: false,
+      text: undefined, dataUrl: undefined, mediaType: '', weightBytes: 0, cached: false,
+      evicted: false, ready: null, _readyDone: true, _resolveReady: null
+    };
+    rec.ready = Promise.resolve(rec);
+    return rec;
+  },
+  _waitForFileRecord: function (id, deadline) {
+    var self = this;
+    return new Promise(function (resolve) {
+      var settled = false;
+      var pollTimer = null;
+      var done = function (rec) {
+        if (settled) return;
+        settled = true;
+        if (pollTimer) clearTimeout(pollTimer);
+        resolve(rec);
+      };
+      var awaitReady = function (rec) {
+        self._touchFileRecord(rec);
+        var remaining = Math.max(1, deadline - Date.now());
+        var wait;
+        if (Utils && typeof Utils.withTimeout === 'function') {
+          wait = Utils.withTimeout(rec.ready, remaining, 'attachment read timed out');
+        } else {
+          wait = new Promise(function (resolveWait, rejectWait) {
+            var timer = setTimeout(function () { rejectWait(new Error('attachment read timed out')); }, remaining);
+            rec.ready.then(function (value) { clearTimeout(timer); resolveWait(value); }, function (error) { clearTimeout(timer); rejectWait(error); });
+          });
+        }
+        wait.then(function () { done(rec); }, function () {
+          rec.timedOut = true;
+          if (!rec.error) rec.error = 'timeout';
+          done(rec);
+        });
+      };
+      var check = function () {
+        var rec = self._fileTexts[id];
+        if (rec) { awaitReady(rec); return; }
+        var remaining = deadline - Date.now();
+        if (remaining <= 0) { done(self._missingFileRecord(id)); return; }
+        pollTimer = setTimeout(check, Math.min(25, remaining));
+      };
+      check();
+    });
+  },
+  waitForFiles: function (fileIds, timeoutMs) {
+    var self = this;
+    var list = Array.isArray(fileIds) ? fileIds : (fileIds == null ? [] : [fileIds]);
+    var ids = [];
+    var seen = Object.create(null);
+    list.forEach(function (value) {
+      var id;
+      try { id = String(value); } catch (e) { return; }
+      if (!id || seen[id]) return;
+      seen[id] = true;
+      ids.push(id);
+    });
+    var timeout = Number(timeoutMs == null ? this.FILE_WAIT_TIMEOUT_MS : timeoutMs);
+    if (!isFinite(timeout) || timeout <= 0) timeout = this.FILE_WAIT_TIMEOUT_MS;
+    var deadline = Date.now() + timeout;
+    var waits = ids.map(function (id) { return self._waitForFileRecord(id, deadline); });
+    return Promise.all(waits).then(function (records) {
+      var out = Object.create(null);
+      records.forEach(function (rec) { if (rec && rec.id) out[rec.id] = rec; });
+      return out;
+    });
+  },
+
+  captureFile: function (req, orig, selfArg) {
+    if (!this._shouldCacheFiles()) return orig.call(selfArg, req);
+    var self = this;
+    var readForm = function () {
+      try { return req.clone().formData(); }
+      catch (e) { return Promise.reject(e); }
+    };
+    return readForm().then(function (fd) {
+      var file = null;
+      try { file = fd && fd.get('file'); } catch (e) {}
+      if (!file) return orig.call(selfArg, req);
+      return orig.call(selfArg, req).then(function (resp) {
+        if (!resp || resp.ok === false || typeof resp.clone !== 'function') return resp;
+        try {
+          resp.clone().json().then(function (meta) {
+            if (!meta || !meta.id) return;
+            self._createFileRecord(meta.id, file, meta);
+          }, function () {});
+        } catch (e) {}
+        return resp;
+      });
+    }, function () {
+      // 非 FormData 或不可读取的 body 保持官方原生行为。
+      return orig.call(selfArg, req);
     });
   },
 
@@ -125,73 +387,263 @@ var DemoApi = {
   patchFetch: function () {
     var self = this;
     var win = (typeof pageWindow === 'function') ? pageWindow() : window;
-    if (!win.fetch) return;
+    if (!win.fetch || typeof Request === 'undefined' || typeof Headers === 'undefined') return;
+    if (win.__dcpFetchPatched) return;
     var orig = win.fetch;
-    DemoApi._origFetch = orig;   // 桥接的出站请求走原生 fetch，避开本补丁的 URL 改写（否则搜索腿会被改写到第三方端点）
+    DemoApi._origFetch = orig;
+    win.__dcpFetchPatched = true;
     win.fetch = function (input, init) {
-      var isMessages = false, bridgeHandled = false;
-      try {
-        var url = typeof input === 'string' ? input : (input && input.url) || '';
-        isMessages = url.indexOf('/anthropic/v1/messages') !== -1;
-        // 附件上传：顺手记下 file_id → 正文（详见 captureFile 注释）。必须在
-        // 下面的 /messages 分支之前——两者 URL 不重叠，顺序只为少一次判断
-        if (url.indexOf('/anthropic/v1/files') !== -1 && init && init.method === 'POST') {
-          return self.captureFile(orig, this, url, init);
-        }
-        // 总开关关闭 = 完全官方逻辑（端点/Key/模型/桥接全部不干预）
-        if (isMessages && DCP.config.get('demoCustom')) {
-          var base = self.base(), key = self.cfg('key'), model = self.cfg('model');
-          var officialEndpoint = self.isOfficialEndpoint(base);
-          // 安全边界：官方 Key 只能发给精确 api.deepseek.com。第三方端点
-          // 必须显式配置独立 Key，绝不静默回退，避免端点写错时泄露官方 Key。
-          if (!officialEndpoint && !key) {
-            return Promise.reject(new Error(DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。')));
-          }
-          // 页面原始 DeepSeek Key（仅供 api.deepseek.com 的搜索/起名腿使用）
-          var origDsKey = (init && init.headers && (init.headers['x-api-key'] || init.headers['X-API-Key'] || init.headers['X-Api-Key'])) || '';
-          // 1) 端点：换成完整接口地址（fullUrl 已按 base/v1/messages 三种填法归一）
-          var full = self.fullUrl();
-          if (full) url = full;
-          // 2) 请求头：第三方端点只保留用户显式配置的 Key，并移除原始官方鉴权头。
-          if (key && init && init.headers) {
-            var h = {};
-            for (var k in init.headers) {
-              if (!Object.prototype.hasOwnProperty.call(init.headers, k)) continue;
-              if (!officialEndpoint && /^(x-api-key|authorization)$/i.test(k)) continue;
-              h[k] = init.headers[k];
-            }
-            h['x-api-key'] = key;
-            init = Object.assign({}, init, { headers: h });
-          }
-          // 3) body.model（其余字段原样，含 tools 数组）
-          if (model && init && typeof init.body === 'string') {
-            var body = JSON.parse(init.body);
-            if (body && body.model !== model) {
-              body.model = model;
-              init = Object.assign({}, init, { body: JSON.stringify(body) });
-            }
-          }
-          // 4) 桥接：端点非 DeepSeek 时，工具执行拆成「客户端工具循环 +
-          //    DeepSeek 极小搜索腿」，demo 侧呈现仍为原生块（见 demobridge.js）
-          if (DCP.modules.demoBridge && DCP.modules.demoBridge.active()) {
-            bridgeHandled = true;
-            var bridged = DCP.modules.demoBridge.intercept(url, init, origDsKey);
-            if (bridged) return bridged;
-          }
-        }
-      } catch (e) {}
-      // 官方端点 / 未走桥接的请求也同步生成状态。旁路读取 response.clone()，
-      // 不改页面拿到的响应；桥接请求由 demobridge 自己发 session:activity。
-      var sync = DCP.modules.sessionSync;
-      var syncRec = (isMessages && !bridgeHandled && sync && sync.enabled()) ? sync.beginNativeRequest() : null;
-      try {
-        var p = orig.call(this, url, init);
-        return syncRec ? sync.observeNativeResponse(p, syncRec) : p;
-      } catch (e) {
-        if (syncRec) sync.finishNativeRequest(syncRec, 'error');
-        throw e;
+      var fetchSelf = this;
+      var req;
+      try { req = new Request(input, init); }
+      catch (e) { return orig.call(fetchSelf, input, init); }
+
+      if (!self._isOfficialRequest(req, self.OFFICIAL_MESSAGES_PATH)) {
+        if (self._isOfficialRequest(req, self.OFFICIAL_FILES_PATH)) return self.captureFile(req, orig, fetchSelf);
+        return self._nativeFetch(orig, fetchSelf, req, false, false);
       }
+      if (!DCP.config.get('demoCustom')) return self._nativeFetch(orig, fetchSelf, req, true, false);
+
+      return req.clone().text().then(function (text) {
+        var body;
+        try { body = JSON.parse(text); }
+        catch (e) { return self._nativeFetch(orig, fetchSelf, req, true, false); }
+        if (!self._isOfficialMessageBody(body)) return self._nativeFetch(orig, fetchSelf, req, true, false);
+        return self._rewriteAndFetch(orig, fetchSelf, req, text, body);
+      }, function () {
+        return self._nativeFetch(orig, fetchSelf, req, true, false);
+      });
     };
+  },
+
+  _isOfficialRequest: function (req, path) {
+    try {
+      var u = new URL(req.url);
+      return req.method === 'POST' && this.OFFICIAL_ORIGINS.indexOf(u.origin) !== -1 &&
+        u.pathname === path && !u.search && !u.hash;
+    } catch (e) {
+      return false;
+    }
+  },
+  _isOfficialMessageBody: function (body) {
+    return !!body && typeof body === 'object' && !Array.isArray(body) &&
+      typeof body.model === 'string' && body.model.length > 0 &&
+      Array.isArray(body.messages) && body.messages.length > 0 &&
+      body.stream === true;
+  },
+  _nativeFetch: function (orig, selfArg, req, isMessages, bridgeHandled) {
+    var sync = DCP.modules.sessionSync;
+    var syncRec = (isMessages && !bridgeHandled && sync && typeof sync.enabled === 'function' && sync.enabled())
+      ? sync.beginNativeRequest() : null;
+    try {
+      var p = orig.call(selfArg, req);
+      if (!syncRec) return p;
+      return p.then(function (resp) {
+        return sync.observeNativeResponse(resp, syncRec);
+      }, function (e) {
+        sync.finishNativeRequest(syncRec, 'error');
+        throw e;
+      });
+    } catch (e) {
+      if (syncRec) sync.finishNativeRequest(syncRec, 'error');
+      throw e;
+    }
+  },
+  _rewriteAndFetch: function (orig, selfArg, req, text, body) {
+    var base = this.base() || this.DEFAULT_BASE;
+    var officialEndpoint = this.isOfficialEndpoint(base);
+    var key = this.cfg('key');
+    if (!officialEndpoint && !key) {
+      return Promise.reject(new Error(DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。')));
+    }
+
+    var full = this.fullUrl() || (this.DEFAULT_BASE.replace(/\/+$/, '') + '/messages');
+    try { new URL(full); }
+    catch (e) { return Promise.reject(new Error('Invalid API endpoint URL')); }
+
+    var model = this.cfg('model');
+    if (!key && !model && full === req.url) return this._nativeFetch(orig, selfArg, req, true, false);
+
+    var headers = new Headers(req.headers);
+    var origDsKey = headers.get('x-api-key') || '';
+    if (!origDsKey) {
+      var auth = headers.get('authorization') || '';
+      origDsKey = auth.replace(/^Bearer\s+/i, '');
+    }
+    if (!officialEndpoint) {
+      headers.delete('x-api-key');
+      headers.delete('authorization');
+      headers.delete('proxy-authorization');
+      headers.delete('cookie');
+    } else if (key) {
+      headers.delete('x-api-key');
+      headers.delete('authorization');
+    }
+    if (key) headers.set('x-api-key', key);
+
+    var outBody = text;
+    if (model && body.model !== model) {
+      body.model = model;
+      outBody = JSON.stringify(body);
+      headers.delete('content-length');
+    }
+    var outReq = new Request(full, {
+      method: req.method,
+      headers: headers,
+      body: outBody,
+      signal: req.signal,
+      credentials: req.credentials,
+      mode: req.mode,
+      cache: req.cache,
+      redirect: req.redirect,
+      referrer: req.referrer,
+      referrerPolicy: req.referrerPolicy,
+      integrity: req.integrity,
+      keepalive: req.keepalive
+    });
+
+    var bridge = DCP.modules.demoBridge;
+    if (bridge && typeof bridge.active === 'function' && bridge.active()) {
+      try {
+        var bridged = bridge.intercept(full, {
+          method: 'POST', headers: headers, body: outBody, signal: req.signal
+        }, origDsKey);
+        if (bridged) return bridged;
+      } catch (e) {
+        return Promise.reject(e);
+      }
+    }
+    return this._nativeFetch(orig, selfArg, outReq, true, false);
+  },
+
+  /* ---------- 敏感输入与连接测试 ---------- */
+  bindKeyInput: function (input) {
+    input.value = '';
+    input.autocomplete = 'off';
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('data-dcp-sensitive', '1');
+    var saved = '';
+    var dirty = false;
+    var timer = null;
+    var commit = function () {
+      if (!dirty) return { ok: true, skipped: true };
+      var value = input.value.trim();
+      var result = DCP.config.set('demoKey', value);
+      saved = value;
+      dirty = false;
+      return result;
+    };
+    input._dseCommit = commit;
+    input._dseClear = function () {
+      clearTimeout(timer); timer = null;
+      if (dirty) commit();
+      input.value = '';
+      dirty = false;
+    };
+    input.addEventListener('focus', function () {
+      if (dirty || input.value) return;
+      saved = String(DCP.config.get('demoKey') || '');
+      input.value = saved;
+    });
+    input.addEventListener('input', function () {
+      dirty = true;
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        timer = null;
+        commit();
+      }, 300);
+    });
+    input.addEventListener('blur', function () {
+      clearTimeout(timer); timer = null;
+      if (dirty) commit();
+      input.value = '';
+      dirty = false;
+    });
+    return input;
+  },
+  _clearSensitiveInputs: function (root) {
+    if (!root || !root.querySelectorAll) return;
+    Array.prototype.forEach.call(root.querySelectorAll('input[data-dcp-sensitive]'), function (input) {
+      if (typeof input._dseClear === 'function') input._dseClear();
+      else input.value = '';
+    });
+  },
+  runConnectionTest: function (options) {
+    if (this._testInFlight) return this._testInFlight;
+    options = options || {};
+    var self = this;
+    var fetchImpl = options.fetchImpl || this._origFetch || window.fetch;
+    if (typeof fetchImpl !== 'function') {
+      return Promise.reject(new Error('fetch is unavailable'));
+    }
+    var timeoutMs = Number(options.timeoutMs || this.TEST_TIMEOUT_MS);
+    if (!isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = this.TEST_TIMEOUT_MS;
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var timedOut = false;
+    var timer = setTimeout(function () {
+      timedOut = true;
+      if (controller) controller.abort();
+    }, timeoutMs);
+    var startedAt = Date.now();
+    var task = (async function () {
+      var headers = { 'Content-Type': 'application/json' };
+      if (options.key) headers.Authorization = 'Bearer ' + options.key;
+      var init = {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({
+          model: options.model || 'deepseek-flash',
+          max_tokens: 1024,
+          thinking: { type: 'disabled' },
+          messages: [{ role: 'user', content: DCP.t('你是什么AI模型？请用一句话直接说明你的模型名称和开发方，不要复述这个问题。') }]
+        })
+      };
+      if (controller) init.signal = controller.signal;
+      var resp = await fetchImpl(options.url, init);
+      var ms = Date.now() - startedAt;
+      if (!resp.ok) {
+        var text = await resp.text();
+        var message = text;
+        try {
+          var parsed = JSON.parse(text);
+          message = (parsed.error && parsed.error.message) || text;
+        } catch (e) {}
+        return { ok: false, status: resp.status, ms: ms, message: String(message).slice(0, 200) };
+      }
+      var json = await resp.json();
+      var content = Array.isArray(json.content) ? json.content : [];
+      var reply = content.filter(function (block) { return block && block.type === 'text'; })
+        .map(function (block) { return block.text || ''; }).join('').trim();
+      return {
+        ok: true,
+        status: resp.status,
+        ms: ms,
+        model: json.model || options.model || 'deepseek-flash',
+        text: reply,
+        stopReason: json.stop_reason || '?',
+        types: content.map(function (block) { return block && block.type; }).join(',')
+      };
+    })();
+
+    var timeoutMessage = DCP.t('连接测试超时，请检查端点或稍后重试。');
+    var wait = (Utils && typeof Utils.withTimeout === 'function')
+      ? Utils.withTimeout(task, timeoutMs, timeoutMessage)
+      : new Promise(function (resolve, reject) {
+          var t = setTimeout(function () { reject(Utils.timeoutError(timeoutMessage)); }, timeoutMs);
+          task.then(function (v) { clearTimeout(t); resolve(v); }, function (e) { clearTimeout(t); reject(e); });
+        });
+    var guarded = wait.then(function (result) {
+      clearTimeout(timer);
+      self._testInFlight = null;
+      return result;
+    }, function (error) {
+      clearTimeout(timer);
+      self._testInFlight = null;
+      if (timedOut || (controller && controller.signal.aborted)) throw Utils.timeoutError(timeoutMessage);
+      throw error;
+    });
+    this._testInFlight = guarded;
+    return guarded;
   },
 
   /* ---------- UI：注入官方设置弹窗（独立「自定义模型」tab） ---------- */
@@ -203,6 +655,7 @@ var DemoApi = {
   injectUI: function () {
     var dlg = document.querySelector('[class*="dialogMain-"]');
     if (!dlg) return;
+    this._clearSensitiveInputs(dlg);
     var self = this;
     // 导航 = 含「通用设置/数据管理」文字的按钮的父容器；内容容器 = rail 兄弟
     // 里那个 flex 列的容器（都不依赖哈希类名）
@@ -273,6 +726,7 @@ var DemoApi = {
       row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
+      label.setAttribute('data-i18n', labelText);
       label.textContent = DCP.t(labelText);
       label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
       var input = document.createElement('input');
@@ -280,21 +734,25 @@ var DemoApi = {
       if (hints && listId) input.setAttribute('list', listId);
       else if (cfgKey === 'model') input.setAttribute('list', 'dcp-model-hints');
       input.placeholder = placeholder;
-      input.value = self.cfg(cfgKey);
       input.title = title;
       input.style.cssText = ctrlStyle;
-      // 即改即存（输入 300ms 防抖、失焦立即）。commit 挂到 input._dseCommit 上，
-      // 底部「保存」按钮靠它冲掉还没落盘的防抖值
-      var commit = function () { DCP.config.set(self.KEYS[cfgKey], input.value.trim()); };
-      input._dseCommit = commit;
-      input.addEventListener('input', function () {
-        clearTimeout(input._dseT);
-        input._dseT = setTimeout(function () { input._dseT = null; commit(); }, 300);
-      });
-      input.addEventListener('blur', function () {
-        clearTimeout(input._dseT); input._dseT = null;
-        commit();
-      });
+      if (cfgKey === 'key') {
+        self.bindKeyInput(input);
+      } else {
+        input.value = self.cfg(cfgKey);
+        // 即改即存（输入 300ms 防抖、失焦立即）。commit 挂到 input._dseCommit 上，
+        // 底部「保存」按钮靠它冲掉还没落盘的防抖值。
+        var commit = function () { return DCP.config.set(self.KEYS[cfgKey], input.value.trim()); };
+        input._dseCommit = commit;
+        input.addEventListener('input', function () {
+          clearTimeout(input._dseT);
+          input._dseT = setTimeout(function () { input._dseT = null; commit(); }, 300);
+        });
+        input.addEventListener('blur', function () {
+          clearTimeout(input._dseT); input._dseT = null;
+          commit();
+        });
+      }
       row.appendChild(label);
       row.appendChild(input);
       return row;
@@ -307,6 +765,7 @@ var DemoApi = {
       row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase;
       var label = document.createElement('div');
+      label.setAttribute('data-i18n', labelText);
       label.textContent = DCP.t(labelText);
       label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
       var sel = document.createElement('select');
@@ -315,7 +774,9 @@ var DemoApi = {
         'padding-right:32px;background-image:' + CHEVRON + ';background-repeat:no-repeat;background-position:right 12px center;';
       options.forEach(function (o) {
         var opt = document.createElement('option');
-        opt.value = o[0]; opt.textContent = DCP.t(o[1]);
+        opt.value = o[0];
+        opt.setAttribute('data-i18n', o[1]);
+        opt.textContent = DCP.t(o[1]);
         sel.appendChild(opt);
       });
       sel.value = self.cfg(cfgKey) || defVal;
@@ -333,6 +794,7 @@ var DemoApi = {
     swRow.setAttribute('data-dcp-api-row', 'custom');
     swRow.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var swLabel = document.createElement('div');
+    swLabel.setAttribute('data-i18n', '自定义模型');
     swLabel.textContent = DCP.t('自定义模型');
     swLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
     var swTrack = document.createElement('div');
@@ -376,6 +838,7 @@ var DemoApi = {
       row.setAttribute('data-dcp-api-row', cfgKey);
       row.style.cssText = rowBase + 'cursor:pointer;user-select:none';
       var label = document.createElement('div');
+      label.setAttribute('data-i18n', labelText);
       label.textContent = DCP.t(labelText);
       label.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
       var track = document.createElement('div');
@@ -400,12 +863,25 @@ var DemoApi = {
 
     // 端点/Key 两行的说明较长，既放可见描述行（withDesc），也放输入框
     // hover 提示（title），两处共用同一字符串
-    var ENDPOINT_DESC = DCP.t('填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 ' + DemoApi.DEFAULT_BASE);
+    var ENDPOINT_DESC = DCP.t('填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 {base}', { base: DemoApi.DEFAULT_BASE });
     var KEY_DESC = DCP.t('第三方端点必须填写独立 Key；只有精确官方 api.deepseek.com 端点可留空并使用页面官方 Key');
     cfgBox.appendChild(withDesc(mkRow('API 端点', 'endpoint', DemoApi.DEFAULT_BASE, ENDPOINT_DESC), ENDPOINT_DESC));
-    cfgBox.appendChild(withDesc(mkRow('API Key', 'key', DCP.t('（第三方端点必填）'), KEY_DESC, true), KEY_DESC));
+    var keyBox = withDesc(mkRow('API Key', 'key', DCP.t('（第三方端点必填）'), KEY_DESC, true), KEY_DESC);
+    var isolatedStorage = !!(DCP.bridge && DCP.bridge.capabilities && DCP.bridge.capabilities.isolatedStorage);
+    var privacyKey = isolatedStorage
+      ? 'API Key 仅保存在用户脚本管理器的隔离存储中，不会写入页面可读的 localStorage；输入框失焦后立即清空。'
+      : '当前环境未检测到隔离存储，API Key 不会保存到页面存储，仅在当前页面会话内有效；刷新后需重新输入。';
+    var privacy = document.createElement('div');
+    privacy.setAttribute('data-i18n', privacyKey);
+    privacy.style.cssText = descStyle + 'opacity:.7;padding-top:2px';
+    privacy.textContent = DCP.t(privacyKey);
+    keyBox.appendChild(privacy);
+    cfgBox.appendChild(keyBox);
     cfgBox.appendChild(mkRow('模型', 'model', DCP.t('deepseek-flash（官方默认）'),
       DCP.t('留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段'), false, DemoApi.HINTS, 'dcp-model-hints'));
+    cfgBox.appendChild(withDesc(mkSelect('语言', 'lang',
+      [['auto', '自动'], ['zh', '中文'], ['en', 'English']], 'auto', DCP.t('界面语言（跟随系统 / 中文 / English）')),
+      DCP.t('界面语言（跟随系统 / 中文 / English）')));
     // 多模态开关：决定图片怎么发。开=转 base64 内联（多模态模型）；
     // 关=换成文字说明——纯文本模型即便收到图也是白烧 token，多半还被拒。
     // 注意 mkSwitch 内部已包 withDesc，这里别再套一层（否则描述渲染两遍）
@@ -421,7 +897,8 @@ var DemoApi = {
     saveRow.setAttribute('data-dcp-api-row', 'save');
     saveRow.style.cssText = rowBase + 'margin-top:2px';
     var saveHint = document.createElement('div');
-    saveHint.textContent = DCP.t('改动会自动保存，关掉面板也不会丢；点此可立即保存并确认');
+    saveHint.setAttribute('data-i18n', '设置改动会自动保存；点此可立即保存并确认。API Key 的保存取决于隔离存储是否可用。');
+    saveHint.textContent = DCP.t('设置改动会自动保存；点此可立即保存并确认。API Key 的保存取决于隔离存储是否可用。');
     saveHint.style.cssText = 'flex:1;font-size:11px;line-height:1.4;opacity:.6;padding-right:8px';
     var saveBtn = document.createElement('button');
     saveBtn.type = 'button';
@@ -431,14 +908,30 @@ var DemoApi = {
       'border-radius:16px;padding:0 20px;font-size:13px;background:' + saveAccent + ';color:#fff;flex:0 0 auto';
     var saveBtnTimer = null;
     saveBtn.addEventListener('click', function () {
-      // 冲掉未落盘的防抖写入（刚打完字还没到 300ms 的情况）
+      var failed = false;
+      var keyWarning = false;
       cfgBox.querySelectorAll('input').forEach(function (inp) {
         if (inp._dseT) { clearTimeout(inp._dseT); inp._dseT = null; }
-        if (typeof inp._dseCommit === 'function') inp._dseCommit();
+        if (typeof inp._dseCommit === 'function') {
+          var committed = inp._dseCommit();
+          if (committed && committed.ok === false) failed = true;
+          if (committed && committed.keyStored === false) keyWarning = true;
+        }
+        if (inp.getAttribute('data-dcp-sensitive') === '1' && typeof inp._dseClear === 'function') inp._dseClear();
       });
-      DCP.config.save();
-      Utils.toast(DCP.t('已保存'), 1500);
-      saveBtn.textContent = DCP.t('已保存 ✓');
+      var saveResult = DCP.config.save();
+      if (!saveResult || saveResult.ok === false) failed = true;
+      if (saveResult && saveResult.keyStored === false) keyWarning = true;
+      if (failed) {
+        Utils.toast(DCP.t('存储写入失败，请检查用户脚本管理器或浏览器存储权限。'), 3200);
+        saveBtn.textContent = DCP.t('保存失败');
+      } else {
+        Utils.toast(DCP.t('已保存'), 1500);
+        saveBtn.textContent = DCP.t('已保存 ✓');
+        if (keyWarning) {
+          Utils.toast(DCP.t('当前环境未检测到隔离存储，API Key 不会保存到页面存储，仅在当前页面会话内有效；刷新后需重新输入。'), 5000);
+        }
+      }
       clearTimeout(saveBtnTimer);
       saveBtnTimer = setTimeout(function () { saveBtn.textContent = DCP.t('保存'); }, 1600);
     });
@@ -452,6 +945,7 @@ var DemoApi = {
     testRow.setAttribute('data-dcp-api-row', 'test');
     testRow.style.cssText = rowBase;
     var testLabel = document.createElement('div');
+    testLabel.setAttribute('data-i18n', '测试连接与模型身份');
     testLabel.textContent = DCP.t('测试连接与模型身份');
     testLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
     var testBtn = document.createElement('button');
@@ -464,51 +958,44 @@ var DemoApi = {
     testResult.setAttribute('data-dcp-test-result', '1');
     testResult.style.cssText = 'display:none;box-sizing:border-box;font-size:11px;line-height:1.5;padding:1px 0 6px;white-space:pre-wrap;word-break:break-all';
     testBtn.addEventListener('click', function () {
+      if (self._testInFlight) return;
+      var restoreButton = function () {
+        testBtn.disabled = false;
+        testBtn.textContent = DCP.t('测试');
+      };
+      testBtn.disabled = true;
+      testBtn.textContent = DCP.t('测试中…');
       testResult.style.display = 'block';
       testResult.style.color = 'inherit';
       testResult.textContent = DCP.t('测试中…');
-      var t0 = Date.now();
       var u = self.fullUrl() || (DemoApi.DEFAULT_BASE.replace(/\/+$/, '') + '/messages');
       var model = (DCP.config.get('demoModel') || '').trim() || 'deepseek-flash';
       var officialEndpoint = self.isOfficialEndpoint(self.base());
-      // Key：第三方端点必须使用独立 Key；只有精确官方端点才能回退页面官方 Key。
       var key = (DCP.config.get('demoKey') || '').trim();
       if (!key && officialEndpoint) { try { key = localStorage.getItem('chat-demo:api-key') || ''; } catch (e) {} }
       if (!officialEndpoint && !key) {
         testResult.style.color = '#f87171';
         testResult.textContent = '❌ ' + DCP.t('第三方端点必须填写独立的 API Key；脚本不会把官方 DeepSeek Key 发送到非官方地址。');
+        restoreButton();
         return;
       }
-      // 与桥接同一套：只用 Authorization: Bearer（详见 demobridge.keyHeader 注释）
-      var headers = { 'Content-Type': 'application/json' };
-      if (key) headers['Authorization'] = 'Bearer ' + key;
-      (DemoApi._origFetch || window.fetch)(u, {
-        method: 'POST', headers: headers,
-        body: JSON.stringify({
-          model: model, max_tokens: 1024, thinking: { type: 'disabled' },
-          messages: [{ role: 'user', content: DCP.t('你是什么AI模型？请用一句话直接说明你的模型名称和开发方，不要复述这个问题。') }]
-        })
-      }).then(function (resp) {
-        var ms = Date.now() - t0;
-        if (!resp.ok) {
-          return resp.text().then(function (t) {
-            var m = t; try { var j = JSON.parse(t); m = (j.error && j.error.message) || t; } catch (e) {}
-            testResult.style.color = '#f87171';
-            testResult.textContent = '❌ ' + DCP.t('连接失败') + '（HTTP ' + resp.status + '，' + ms + 'ms）\n' + String(m).slice(0, 200);
-          });
-        }
-        return resp.json().then(function (j) {
-          var txt = (j.content || []).filter(function (b) { return b.type === 'text'; })
-            .map(function (b) { return b.text || ''; }).join('').trim();
+      self.runConnectionTest({ url: u, model: model, key: key }).then(function (result) {
+        if (result.ok) {
           testResult.style.color = '#4ade80';
-          testResult.textContent = '✅ ' + DCP.t('连接成功') + '（' + ms + 'ms）· ' + DCP.t('模型') + '：' + (j.model || model) +
-            '\n' + DCP.t('模型自述') + '：' + (txt ||
-            (DCP.t('（未获得文本回复') + '，stop_reason=' + (j.stop_reason || '?') + '，内容块=' + (j.content || []).map(function (b) { return b.type; }).join(',') + '）'));
-        });
-      }).catch(function (e) {
+          testResult.textContent = '✅ ' + DCP.t('连接成功') + '（' + result.ms + 'ms）· ' + DCP.t('模型') + '：' + result.model +
+            '\n' + DCP.t('模型自述') + '：' + (result.text ||
+            (DCP.t('（未获得文本回复）') + '，stop_reason=' + result.stopReason + '，内容块=' + result.types + '）'));
+        } else {
+          testResult.style.color = '#f87171';
+          testResult.textContent = '❌ ' + DCP.t('连接失败') + '（HTTP ' + result.status + '，' + result.ms + 'ms）\n' + result.message;
+        }
+      }, function (e) {
         testResult.style.color = '#f87171';
         var hint = (e && e.name === 'TypeError') ? DCP.t('（浏览器安全策略拦截了跨域请求，可在高级选项切换鉴权头试试）') : '';
-        testResult.textContent = '❌ ' + DCP.t('请求失败') + '：' + String(e && e.message || e).slice(0, 150) + hint;
+        testResult.textContent = '❌ ' + DCP.t('连接测试失败') + '：' + String(e && e.message || e).slice(0, 150) + hint;
+      }).then(restoreButton, function (e) {
+        restoreButton();
+        throw e;
       });
     });
     testRow.appendChild(testLabel); testRow.appendChild(testBtn);
@@ -520,6 +1007,7 @@ var DemoApi = {
     advToggle.setAttribute('data-dcp-api-row', 'advanced');
     advToggle.style.cssText = rowBase + 'cursor:pointer;user-select:none';
     var advLabel = document.createElement('div');
+    advLabel.setAttribute('data-i18n', '高级选项');
     advLabel.textContent = DCP.t('高级选项');
     advLabel.style.cssText = 'flex:1;font-size:' + (labelCss.fontSize || '14px') + ';color:' + (labelCss.color || 'inherit');
     var advArrow = document.createElement('span');
@@ -564,7 +1052,7 @@ var DemoApi = {
       DCP.t('侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文。刷新页面只恢复一次当前会话。')));
     advBox.appendChild(withDesc(mkSelect('搜索来源', 'bridge',
       [['auto', 'auto：DeepSeek 原生搜索'], ['off', 'off：用模型自带的']], 'auto'),
-      'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）'));
+      DCP.t('auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）')));
     cfgBox.appendChild(advToggle);
     cfgBox.appendChild(advBox);
 
@@ -682,6 +1170,21 @@ var DemoApi = {
         window.DSE.config && window.DSE.config.get('demoCustom')) {
       console.log('[DCP] 检测到 deepseek-enhance 已接管自定义模型，本脚本待机（在它里面关掉 demoCustom 即可由本脚本接管）');
       return;
+    }
+    if (!this._fileConfigBound) {
+      this._fileConfigBound = true;
+      DCP.on('cfg:change', function (event) {
+        if (!event) return;
+        if (event.path === '*' || (event.path === 'demoCustom' && !event.value)) self.clearFileCache();
+      });
+    }
+    if (!this._keyWarningBound) {
+      this._keyWarningBound = true;
+      DCP.on('cfg:warning', function (event) {
+        if (!event || event.code !== 'KEY_NOT_PERSISTED' || self._keyWarningShown) return;
+        self._keyWarningShown = true;
+        Utils.toast(DCP.t('当前环境未检测到隔离存储，API Key 不会保存到页面存储，仅在当前页面会话内有效；刷新后需重新输入。'), 5000);
+      });
     }
     this.patchFetch();
     this.fixFavicon();

@@ -33,6 +33,17 @@
  * ============================================================ */
 var DemoBridge = {
   LEG_TIMEOUT: 60000,
+  // 会话身份只用于恢复历史和侧栏状态，不能阻塞官方加载态。IndexedDB 异常时
+  // 最多等这么久，超时后先照常请求，后续解析成功再补发 sessionId。
+  SESSION_WAIT_MS: 1200,
+  SESSION_REFRESH_TIMEOUT_MS: 2500,
+  // 主请求头、SSE idle、搜索接口正文都要有硬 deadline；超时必须取消底层
+  // reader/fetch，不能留下永远挂起的 Promise。
+  MAIN_HEADERS_TIMEOUT_MS: 30000,
+  PUMP_IDLE_TIMEOUT_MS: 45000,
+  SEARCH_API_TIMEOUT_MS: 20000,
+  FILE_WAIT_TIMEOUT_MS: 8000,
+  PERSIST_RETRY_MS: 250,
   // 不再对腿报告设字符上限（2026-11-19 用户要求去掉）：搜索/读网页的完整内容
   // 原样作为 tool_result 喂回模型。代价是连续搜索时上下文涨得快——工具块不像
   // 官方端点那样被服务端清洗，会一直留在后续请求里（见模块头「本模块不做历史
@@ -66,6 +77,82 @@ var DemoBridge = {
     return (DCP.modules.demoApi && DCP.modules.demoApi._origFetch) || window.fetch;
   },
 
+  abortError: function () {
+    try { return new DOMException('Aborted', 'AbortError'); }
+    catch (e) { var err = new Error('Aborted'); err.name = 'AbortError'; return err; }
+  },
+
+  // 让一个 Promise 能被用户 abort 立即打断；底层 fetch 仍用自己的 signal，
+  // 因此这里只负责“提前结束等待”，finally 中统一移除监听。
+  raceAbort: function (promise, signal) {
+    if (!signal) return Promise.resolve(promise);
+    var self = this;
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      function finish(fn, value) {
+        if (settled) return;
+        settled = true;
+        try { signal.removeEventListener('abort', onAbort); } catch (e) {}
+        fn(value);
+      }
+      function onAbort() { finish(reject, self.abortError()); }
+      var alreadyAborted = !!signal.aborted;
+      if (!alreadyAborted) {
+        try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) {}
+      }
+      Promise.resolve(promise).then(function (v) { finish(resolve, v); }, function (e) { finish(reject, e); });
+      if (alreadyAborted) onAbort();
+    });
+  },
+
+  // 带可取消 timer 的 deadline。raceAbort 提前结束时必须 cancel()，否则一个
+  // 已经不再被等待的 timeout 会把页面/测试进程白拖几十秒。
+  withDeadline: function (promise, ms, message, onTimeout) {
+    var self = this, timer = null, settled = false;
+    var result = new Promise(function (resolve, reject) {
+      timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        if (onTimeout) { try { onTimeout(); } catch (e) {} }
+        reject(Utils.timeoutError(message));
+      }, ms);
+      Promise.resolve(promise).then(function (v) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); reject(e);
+      });
+    });
+    result.cancel = function () { clearTimeout(timer); };
+    return result;
+  },
+
+  // 主请求只等响应头；超时后 abort 内部 controller，并把 TimeoutError 留给
+  // 统一 finalize 处理。使用内部 controller 可以避免“超时 abort 父 signal”
+  // 把 TimeoutError 误染成用户 AbortError。
+  fetchWithDeadline: function (url, init, ms) {
+    var self = this;
+    var controller = new AbortController();
+    var parent = init && init.signal;
+    var onParentAbort = function () { controller.abort(); };
+    if (parent) {
+      if (parent.aborted) controller.abort();
+      else {
+        try { parent.addEventListener('abort', onParentAbort, { once: true }); } catch (e) {}
+      }
+    }
+    var fetchInit = Object.assign({}, init || {}, { signal: controller.signal });
+    var operation = Promise.resolve().then(function () { return self.nativeFetch()(url, fetchInit); });
+    var deadline = self.withDeadline(operation, ms, 'model response headers timed out', function () {
+      controller.abort();
+    });
+    return self.raceAbort(deadline, parent).finally(function () {
+      deadline.cancel();
+      if (parent) { try { parent.removeEventListener('abort', onParentAbort); } catch (e) {} }
+    });
+  },
+
   // 出站头：只发最小必要集，绝不照抄页面原始头。
   // 2026-11-18 实测（StepFun）：页面请求自带 anthropic-version、x-ds-trace-id
   // 和一个小写 content-type，桥接原先连它们一起转发——而这些头不在 StepFun 的
@@ -84,6 +171,26 @@ var DemoBridge = {
   },
 
   /* ---------- 出站请求构造（第三方端点） ---------- */
+  // 附件上传与 messages 请求是并行发生的：首次 buildOutbound 时 file_id 可能
+  // 还没有正文/DataURL。主请求前按 ID 等附件缓存就绪，再重建一次 outbound。
+  outboundFileIds: function (messages) {
+    var ids = [], seen = Object.create(null);
+    (messages || []).forEach(function (m) {
+      if (!m || !Array.isArray(m.content)) return;
+      m.content.forEach(function (block) {
+        if (!block || (block.type !== 'document' && block.type !== 'image')) return;
+        var src = block.source || {};
+        var id = src.type === 'file' ? (src.file_id || src.fileId) : '';
+        if (!id) return;
+        id = String(id);
+        if (seen[id]) return;
+        seen[id] = true;
+        ids.push(id);
+      });
+    });
+    return ids;
+  },
+
   buildOutbound: function (body, origHeaders) {
     var messages = [];
     var reminder = '';
@@ -229,9 +336,10 @@ var DemoBridge = {
     if (!stream || typeof stream.getReader !== 'function') {
       return Promise.reject(new Error('response stream unavailable'));
     }
+    var self = this;
     var reader = stream.getReader();
     var dec = new TextDecoder();
-    var buf = '', pendingCR = false;
+    var buf = '', pendingCR = false, terminal = false, sawEOF = false, readDeadline = null;
     function normalizeChunk(text, final) {
       var out = '';
       for (var i = 0; i < text.length; i++) {
@@ -261,37 +369,48 @@ var DemoBridge = {
       }
       if (!dataLines.length) return;
       var data = dataLines.join('\n');
-      if (data === '[DONE]') return;
+      if (data === '[DONE]') { terminal = true; return; }
       var j = null;
-      try { j = JSON.parse(data); } catch (e) { return; }
+      try { j = JSON.parse(data); } catch (e) { throw new Error('模型响应包含无效的 SSE 数据'); }
       if (j.type === 'error' || (j.error && j.error.message)) {
         throw new Error((j.error && j.error.message) || 'stream error');
       }
       onEvent(j);
+      if (j.type === 'message_stop') terminal = true;
     }
     function drain(final) {
       var idx;
       while ((idx = buf.indexOf('\n\n')) !== -1) {
         var ev = buf.slice(0, idx); buf = buf.slice(idx + 2);
         dispatch(ev);
+        if (terminal) { buf = ''; break; }
       }
-      if (final && buf) { dispatch(buf); buf = ''; }
+      if (final && buf && !terminal) { dispatch(buf); buf = ''; }
     }
     return (async function () {
       try {
-        while (true) {
-          if (signal && signal.aborted) {
-            try { await reader.cancel(); } catch (e) {}
-            throw new DOMException('Aborted', 'AbortError');
+        while (!terminal) {
+          if (signal && signal.aborted) throw self.abortError();
+          var readPromise = reader.read();
+          if (self.PUMP_IDLE_TIMEOUT_MS > 0) {
+            readDeadline = self.withDeadline(readPromise, self.PUMP_IDLE_TIMEOUT_MS, 'model stream idle timeout');
+            readPromise = readDeadline;
           }
-          var r = await reader.read();
-          if (r.done) break;
+          var r;
+          try { r = await self.raceAbort(readPromise, signal); }
+          finally { if (readDeadline) { readDeadline.cancel(); readDeadline = null; } }
+          if (r.done) { sawEOF = true; break; }
           buf += normalizeChunk(dec.decode(r.value, { stream: true }), false);
           drain(false);
         }
-        buf += normalizeChunk(dec.decode(), true);
-        drain(true);
+        if (!terminal) {
+          buf += normalizeChunk(dec.decode(), true);
+          drain(true);
+        }
       } finally {
+        // message_stop / [DONE] / error / timeout / abort 都不能把 reader 留在
+        // 上游。cancel() 可能自身不返回，但不阻塞主流程。
+        if (!sawEOF) { try { Utils.cancelReader(reader); } catch (e) {} }
         try { reader.releaseLock(); } catch (e) {}
       }
     })();
@@ -306,6 +425,7 @@ var DemoBridge = {
   // server_tool_use / web_search_tool_result 块转发，界面呈现与 native 一致
   runLegSearchApi: function (toolName, toolInput, dsKey, push, nextIdx, signal, toolId, roundIndex) {
     var self = this;
+    if (signal && signal.aborted) return Promise.reject(self.abortError());
     var isRead = toolName === 'read_url';
     var ti = toolInput || {};
     var q = isRead ? String(ti.url || '') : String(ti.query || '').slice(0, 128);
@@ -320,20 +440,33 @@ var DemoBridge = {
     // 能改善查询理解（智能体内部的检索词往往是压缩过的关键词串）
     var oriQ = String(ti.ori_question || self._firstUser || '').replace(/\s+/g, ' ').trim().slice(0, 128);
     var ac = new AbortController();
-    var timer = setTimeout(function () { ac.abort(); }, 20000);
-    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var onAbort = function () { ac.abort(); };
+    if (signal) {
+      try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) {}
+    }
     var url = isRead ? 'https://api.deepseek.com/v1/tools/fetch' : 'https://api.deepseek.com/v1/tools/search';
     var reqBody = isRead ? { url: q }
       : { query: q, count: cnt, need_content: wantContent, ori_question: oriQ || null };
-    return this.nativeFetch()(url, {
-      method: 'POST', signal: ac.signal,
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
-      body: JSON.stringify(reqBody)
+    // 超时覆盖 fetch、响应头和 resp.json()/resp.text() 整个正文读取。旧实现
+    // 在拿到响应头时就 clearTimeout，正文卡住会让工具腿永远挂起。
+    var operation = Promise.resolve().then(function () {
+      return self.nativeFetch()(url, {
+        method: 'POST', signal: ac.signal,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + dsKey },
+        body: JSON.stringify(reqBody)
+      });
     }).then(function (resp) {
-      clearTimeout(timer);
-      if (!resp.ok) throw new Error((isRead ? 'fetch' : 'search') + ' api http ' + resp.status);
+      if (!resp.ok) {
+        return resp.text().then(function (t) {
+          throw new Error((isRead ? 'fetch' : 'search') + ' api http ' + resp.status + ': ' + String(t || '').slice(0, 120));
+        });
+      }
       return resp.json();
-    }).then(function (j) {
+    });
+    var deadline = self.withDeadline(operation, self.SEARCH_API_TIMEOUT_MS, 'search api timeout', function () {
+      ac.abort();
+    });
+    return self.raceAbort(deadline, signal).then(function (j) {
       var id = 'srvtoolu_sa_' + Math.random().toString(36).slice(2, 10);
       var i1 = nextIdx(), i2 = nextIdx();
       // 官方 demo 对普通 search 按整个 assistant 消息全局合并；桥接的多轮
@@ -384,9 +517,9 @@ var DemoBridge = {
         push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i2 }));
       }
       return { text: toolResultText };
-    }).catch(function (e) {
-      clearTimeout(timer);
-      throw e;
+    }).finally(function () {
+      deadline.cancel();
+      if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (e) {} }
     });
   },
 
@@ -549,6 +682,7 @@ var DemoBridge = {
       return this.runLegSearchApi(toolName, toolInput, dsKey, push, nextIdx, signal, toolId, roundIndex);
     }
     var self = this;
+    if (signal && signal.aborted) return Promise.reject(self.abortError());
     var q = toolName === 'read_url' ? ('请读取并详细总结这个网页的内容：' + (toolInput.url || ''))
                                     : ('请深入调研以下问题，搜索并阅读相关网页，然后给出有据可查的结论：\n' + (toolInput.query || ''));
     var tools = toolName === 'read_url'
@@ -556,14 +690,20 @@ var DemoBridge = {
       : [{ name: 'deepseek_read_url', type: 'deepseek_read_url' }, { name: 'deepseek_web_search', type: 'deepseek_web_search' }];
     var body = { model: 'deepseek-flash', stream: true, thinking: { type: 'enabled' }, max_tokens: 4096, tools: tools, messages: [{ role: 'user', content: q }] };
     var ac = new AbortController();
-    var timer = setTimeout(function () { ac.abort(); }, this.LEG_TIMEOUT);
-    if (signal) signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
-    return this.nativeFetch()(this.DS_LEG_BASE + '/messages', {
-      method: 'POST', signal: ac.signal,
-      headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
-      body: JSON.stringify(body)
+    var onAbort = function () { ac.abort(); };
+    if (signal) {
+      try { signal.addEventListener('abort', onAbort, { once: true }); } catch (e) {}
+    }
+    var operation = Promise.resolve().then(function () {
+      return self.nativeFetch()(self.DS_LEG_BASE + '/messages', {
+        method: 'POST', signal: ac.signal,
+        headers: { 'Content-Type': 'application/json', 'x-api-key': dsKey, 'Accept': 'text/event-stream' },
+        body: JSON.stringify(body)
+      });
     }).then(function (resp) {
-      if (!resp.ok) return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
+      if (!resp.ok) {
+        return resp.text().then(function (t) { throw new Error('leg http ' + resp.status + ': ' + t.slice(0, 200)); });
+      }
       var out = { blocks: [], text: '', usage: null };
       // 同主流程：input 类 usage 可能只在 message_start 给
       var mergeLegUsage = function (u) {
@@ -603,10 +743,14 @@ var DemoBridge = {
         } else if (j.type === 'message_delta') {
           mergeLegUsage(j.usage);
         }
-      }, ac.signal).then(function () { clearTimeout(timer); return out; });
-    }).catch(function (e) {
-      clearTimeout(timer);
-      throw e;
+      }, ac.signal).then(function () { return out; });
+    });
+    var deadline = self.withDeadline(operation, self.LEG_TIMEOUT, 'tool leg timeout', function () {
+      ac.abort();
+    });
+    return self.raceAbort(deadline, signal).finally(function () {
+      deadline.cancel();
+      if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (e) {} }
     });
   },
 
@@ -621,16 +765,65 @@ var DemoBridge = {
     // 这组身份；用户切会话后 DemoSearch.invalidateRequests() 会递增 epoch，
     // 上一请求的迟到事件直接丢弃，不再异步解析后覆盖新会话。
     var search = DCP.modules && DCP.modules.demoSearch;
+    var requestStartedAt = Date.now();
     var requestCtx = search && typeof search.beginRequest === 'function'
       ? search.beginRequest()
       : { requestId: 'dcpr_local_' + Math.random().toString(36).slice(2), epoch: 0, sessionId: null, session: Promise.resolve(null) };
-    var requestSession = requestCtx && requestCtx.session ? await requestCtx.session : null;
-    var requestSessionId = requestCtx && requestCtx.sessionId || (requestSession && requestSession.id) || null;
+    // bridgeMessageId 在第一条 message_start 之前同步生成；official assistant id
+    // 由 IndexedDB 中的占位符异步补获，绝不能为了等它而推迟首条事件。
+    requestCtx.bridgeMessageId = requestCtx.bridgeMessageId || ('msg_bridge_' + Math.random().toString(36).slice(2, 10));
+    requestCtx.assistantMessageId = requestCtx.assistantMessageId || null;
+    requestCtx.persistRevision = Number(requestCtx.persistRevision) || 0;
+    requestCtx.persistQueue = requestCtx.persistQueue || Promise.resolve();
+    var requestSessionId = requestCtx && requestCtx.sessionId || null;
+    var requestActive = true;
     var eventMeta = function (extra) {
-      return Object.assign({ requestId: requestCtx && requestCtx.requestId || '', sessionId: requestSessionId }, extra || {});
+      return Object.assign({
+        requestId: requestCtx && requestCtx.requestId || '',
+        sessionId: requestSessionId,
+        epoch: requestCtx && requestCtx.epoch,
+        bridgeMessageId: requestCtx && requestCtx.bridgeMessageId || '',
+        assistantMessageId: requestCtx && requestCtx.assistantMessageId || null
+      }, extra || {});
+    };
+    var captureAssistant = function (s) {
+      if (!requestCtx || !s || !search || typeof search.captureBridgeAssistantId !== 'function') return;
+      search.captureBridgeAssistantId(requestCtx, s, body.messages);
     };
     var endRequest = function () {
+      requestActive = false;
       if (search && typeof search.finishRequest === 'function' && requestCtx) search.finishRequest(requestCtx.requestId);
+    };
+    // 会话解析在后台完成；首条消息的 IndexedDB 往往晚于请求落盘，解析成功后
+    // 只补发一次 generating，让侧栏/跨标签把转圈挂到正确会话，不重新绑定旧请求。
+    if (requestCtx && requestCtx.session && typeof requestCtx.session.then === 'function') {
+      requestCtx.session.then(function (s) {
+        if ((!requestActive && !persistDirty) || !s || !s.id) return;
+        var resolvedNewSession = !requestSessionId;
+        if (resolvedNewSession) requestSessionId = s.id;
+        captureAssistant(s);
+        if (resolvedNewSession) DCP.emit('session:activity', eventMeta({ state: 'generating' }));
+      }, function () {});
+    }
+    var waitRequestSession = function () {
+      if (!requestCtx || !requestCtx.session || typeof requestCtx.session.then !== 'function') return Promise.resolve(null);
+      return new Promise(function (resolve) {
+        var settled = false;
+        var done = function (s) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (ac && ac.signal) ac.signal.removeEventListener('abort', onAbort);
+          resolve(s || null);
+        };
+        var onAbort = function () { done(null); };
+        var timer = setTimeout(function () { done(null); }, self.SESSION_WAIT_MS);
+        if (ac && ac.signal) {
+          if (ac.signal.aborted) onAbort();
+          else ac.signal.addEventListener('abort', onAbort, { once: true });
+        }
+        requestCtx.session.then(done, function () { done(null); });
+      });
     };
 
     /* ---------- 实时速率（按整个请求累计） ----------
@@ -700,49 +893,227 @@ var DemoBridge = {
       DCP.emit('session:activity', eventMeta({ state: state || 'stopped' }));
     };
 
-    // 官方 demo 会把工具块从下一次 API 请求里过滤掉，但它自己的 IndexedDB
-    // 仍完整保存着这些块。只从请求发起时唯一确定的当前会话恢复中断轮，
-    // 不另建存储、不截断内容，也不扫描其它会话。
-    try {
-      var canRecover = !search || typeof search.isRequestCurrent !== 'function' ||
-        search.isRequestCurrent({ requestId: requestCtx.requestId, sessionId: requestSessionId });
-      var recovered = canRecover && requestSession
-        ? await search.recoverBridgeRequest(body.messages, requestSession)
-        : null;
-      if (recovered && recovered.messages) {
-        body = Object.assign({}, body, { messages: recovered.messages });
-        console.log('[DCP] recovered interrupted bridge history', {
-          sessionId: recovered.sessionId,
-          targetId: recovered.targetId,
-          status: recovered.status,
-          mode: recovered.mode,
-          recoveredMessages: recovered.recoveredMessages,
-          recoveredBlocks: recovered.recoveredBlocks
-        });
-      }
-    } catch (e) {
-      console.warn('[DCP] recover bridge history failed', e);
-    }
-
+    // 先同步构造出站骨架并立刻返回合成 Response；会话恢复改为后台预检，
+    // 不再让 IndexedDB 延迟官方加载态。
     var outbound = this.buildOutbound(body, init.headers || {});
-    // 会话首条用户消息：搜索腿的 ori_question 兜底（官方文档说带上原始问题能改善
-    // 查询理解——智能体内部的检索词往往是压缩过的关键词串）
     self._firstUser = this.firstUserText(body.messages);
     var enc = new TextEncoder();
-    var q = [], done = false, wake = null;
-    var push = function (s) { q.push(s); if (wake) { var w = wake; wake = null; w(); } };
-    var finish = function () { done = true; if (wake) { var w = wake; wake = null; w(); } };
+    var q = [], done = false, streamCtl = null, detached = false, consumerGone = false;
+    var persistSse = null, onDetach = null, finalized = false;
+    var persistDirty = false;
+    var push = function (s) {
+      if (finalized) return;
+      if (requestActive && !requestIsCurrent()) {
+        detached = true;
+        if (onDetach) { try { onDetach(); } catch (e) {} }
+      }
+      if (persistSse) { try { persistSse(s); } catch (e) {} }
+      if (consumerGone || detached) return;
+      if (streamCtl) {
+        try { streamCtl.enqueue(enc.encode(s)); return; } catch (e) {
+          consumerGone = true;
+          if (onDetach) { try { onDetach(); } catch (e) {} }
+          return;
+        }
+      }
+      q.push(s);
+    };
+    var finish = function () {
+      done = true;
+      if (!consumerGone && streamCtl) {
+        try { streamCtl.close(); return; } catch (e) {}
+      }
+    };
     var ac = new AbortController();
-    if (init.signal) init.signal.addEventListener('abort', function () { ac.abort(); }, { once: true });
+    var requestIsCurrent = function () {
+      return !search || typeof search.isRequestCurrent !== 'function' || search.isRequestCurrent(requestCtx);
+    };
+    var handleAbort = function () {
+      // 当前会话点停止：立即取消上游。切会话造成的 abort/cancel 只脱离页面
+      // reader，继续消费已经在途的请求，避免原对话被中途掐断。
+      if (requestIsCurrent()) ac.abort();
+      else {
+        detached = true;
+        if (onDetach) { try { onDetach(); } catch (e) {} }
+      }
+    };
+    if (init.signal) {
+      if (init.signal.aborted) handleAbort();
+      else init.signal.addEventListener('abort', handleAbort, { once: true });
+    }
 
     var stream = new ReadableStream({
+      start: function (c) { streamCtl = c; },
       pull: function (c) {
         if (q.length) { c.enqueue(enc.encode(q.shift())); return; }
         if (done) { c.close(); return; }
-        return new Promise(function (r) { wake = r; });
       },
-      cancel: function () { ac.abort(); }
+      cancel: function () {
+        consumerGone = true;
+        if (requestIsCurrent()) ac.abort();
+        else {
+          detached = true;
+          if (onDetach) { try { onDetach(); } catch (e) {} }
+        }
+      }
     });
+
+    // 页面把 error 事件标成不可继续的 error；而官网“继续生成”只认
+    // stopped 或 done + max_tokens。已经有可见内容后断流，必须按官方的
+    // “输出被截断”形状收尾，不能伪装成 end_turn，也不能只发 error。
+    var hasVisibleContent = false, openBlocks = {};
+    var closeOpenBlocks = function () {
+      Object.keys(openBlocks).map(Number).sort(function (a, b) { return a - b; }).forEach(function (i) {
+        push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: i }));
+      });
+      openBlocks = {};
+    };
+    var emitFailure = function (message, usage) {
+      var text = String(message || '模型连接中断').slice(0, 200);
+      if (!hasVisibleContent) {
+        push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: text } }));
+        return false;
+      }
+      closeOpenBlocks();
+      push(self.sseEvent('message_delta', { type: 'message_delta',
+        delta: { stop_reason: 'max_tokens', stop_sequence: null }, usage: usage || {} }));
+      push(self.sseEvent('message_stop', { type: 'message_stop' }));
+      return true;
+    };
+
+    // 切会话后官方 React reader 可能已经卸载，继续转发也不会落盘。这里始终
+    // 记录下游块的官方形状；只有确认进入 detached / reader 已取消后才写回
+    // IndexedDB。所有写入通过 requestCtx.persistQueue 串行化，失败则保留
+    // dirty 快照重试。
+    var persistBlocks = [], persistMap = {}, persistStopReason = null, persistUsage = null;
+    var persistStatus = 'pending', persistFinal = false, persistTimer = null;
+    var cloneJson = function (v) { return JSON.parse(JSON.stringify(v)); };
+    var shouldPersist = function () { return detached || consumerGone; };
+    var retryPersist = function () {
+      persistDirty = true;
+      if (persistTimer) return;
+      persistTimer = setTimeout(flushPersist, self.PERSIST_RETRY_MS);
+    };
+    var flushPersist = function () {
+      persistTimer = null;
+      if (!persistDirty || !shouldPersist() || !requestSessionId || !search ||
+          typeof search.persistBridgeState !== 'function') return;
+      persistDirty = false;
+      var attempt = function () {
+        var revision = ++requestCtx.persistRevision;
+        var state = {
+          blocks: cloneJson(persistBlocks),
+          status: persistStatus,
+          stopReason: persistStopReason,
+          usage: persistUsage,
+          assistantMessageId: requestCtx.assistantMessageId,
+          bridgeMessageId: requestCtx.bridgeMessageId,
+          revision: revision
+        };
+        var pending;
+        try { pending = search.persistBridgeState(requestSessionId, state, requestCtx); }
+        catch (e) { pending = Promise.reject(e); }
+        Promise.resolve(pending).then(function (ok) {
+          if (ok === false) retryPersist();
+        }, retryPersist);
+      };
+      // 占位符可能晚于会话 ID 落盘。写前再按 sessionId 读一次，拿到精确
+      // assistantMessageId 后才允许 persistBridgeState 更新。
+      if (!requestCtx.assistantMessageId && typeof search.readSession === 'function') {
+        Promise.resolve(search.readSession(requestSessionId)).then(function (s) {
+          captureAssistant(s);
+          attempt();
+        }, attempt);
+      } else {
+        attempt();
+      }
+    };
+    var schedulePersist = function (immediate) {
+      if (!shouldPersist()) return;
+      persistDirty = true;
+      if (persistTimer) return;
+      persistTimer = setTimeout(flushPersist, immediate ? 0 : 250);
+    };
+    onDetach = function () { schedulePersist(true); };
+    persistSse = function (s) {
+      var m = /^event: ([^\n]+)\ndata: ([\s\S]*)\n\n$/.exec(s);
+      if (!m) return;
+      var j;
+      try { j = JSON.parse(m[2]); } catch (e) { return; }
+      if (j.type === 'content_block_start') {
+        var cb = j.content_block || {};
+        var pb = null;
+        if (cb.type === 'text') {
+          pb = cloneJson(cb); pb.text = pb.text || ''; pb.citations = pb.citations || [];
+        } else if (cb.type === 'thinking') {
+          pb = cloneJson(cb); pb.thinking = pb.thinking || ''; pb.signature = pb.signature || '';
+          pb.startedAt = pb.startedAt || Date.now(); pb.endedAt = pb.endedAt || null;
+        } else if (['server_tool_use', 'web_search_tool_result', 'web_fetch_tool_result'].indexOf(cb.type) !== -1) {
+          pb = cloneJson(cb);
+        }
+        if (pb) persistMap[j.index] = persistBlocks.push(pb) - 1;
+      } else if (j.type === 'content_block_delta') {
+        var d = j.delta || {}, pbi = persistMap[j.index], block = persistBlocks[pbi];
+        if (block) {
+          if (d.type === 'text_delta') block.text = String(block.text || '') + String(d.text || '');
+          else if (d.type === 'thinking_delta') block.thinking = String(block.thinking || '') + String(d.thinking || '');
+          else if (d.type === 'signature_delta') block.signature = String(block.signature || '') + String(d.signature || '');
+        }
+      } else if (j.type === 'content_block_stop') {
+        var stopped = persistBlocks[persistMap[j.index]];
+        if (stopped && stopped.type === 'thinking') stopped.endedAt = Date.now();
+      } else if (j.type === 'message_delta') {
+        persistStopReason = j.delta && j.delta.stop_reason || null;
+        persistUsage = j.usage || persistUsage;
+      } else if (j.type === 'message_stop') {
+        persistFinal = true;
+        persistStatus = 'done';
+      }
+      schedulePersist(j.type === 'message_stop');
+    };
+    var finalize = function (activityState, persistState, stopReason, abortUpstream) {
+      if (finalized) return;
+      finalized = true;
+      if (persistState) {
+        persistStatus = persistState;
+        if (arguments.length >= 3) persistStopReason = stopReason;
+        persistFinal = true;
+        persistDirty = true;
+        // 后台流一定自己落盘；用户停止/错误即使页面 reader 还在，也统一
+        // 写一次终态，避免官网只把 UI 停在 stopped/error 而 IndexedDB 丢失。
+        if (shouldPersist() || activityState === 'stopped' || activityState === 'error') {
+          if (!requestSessionId) resolveOriginSession();
+          schedulePersist(true);
+        }
+      }
+      if (abortUpstream && ac) { try { ac.abort(); } catch (e) {} }
+      tpsIdle(activityState);
+      endRequest();
+      finish();
+    };
+    var originResolving = false;
+    var resolveOriginSession = async function () {
+      if (originResolving || requestSessionId || !search ||
+          typeof search.findSessionByRequestMessages !== 'function') return;
+      if (!requestActive && !persistDirty) return;
+      originResolving = true;
+      try {
+        var s = await Utils.withTimeout(
+          search.findSessionByRequestMessages(body.messages, requestStartedAt),
+          self.SESSION_REFRESH_TIMEOUT_MS,
+          'origin session lookup timed out'
+        );
+        if (s && s.id && !requestSessionId) {
+          requestSessionId = s.id;
+          captureAssistant(s);
+          if (requestActive) DCP.emit('session:activity', eventMeta({ state: 'generating' }));
+          schedulePersist(true);
+        }
+      } catch (e) {
+      } finally {
+        originResolving = false;
+      }
+    };
 
     (async function () {
       var idx = 0;
@@ -778,14 +1149,66 @@ var DemoBridge = {
           ).catch(function () { return ''; });
         }
       }
+      var roundSawDelta = false;
       try {
+        if (ac.signal.aborted) throw self.abortError();
         push(self.sseEvent('message_start', {
           type: 'message_start',
-          message: { id: 'msg_bridge_' + Math.random().toString(36).slice(2, 10), type: 'message', role: 'assistant',
+          message: { id: requestCtx.bridgeMessageId, type: 'message', role: 'assistant',
             model: outbound.body.model, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }
         }));
         DCP.emit('tps:start', eventMeta());
         DCP.emit('session:activity', eventMeta({ state: 'generating' }));
+        resolveOriginSession();
+        setTimeout(resolveOriginSession, 250);
+        setTimeout(resolveOriginSession, 1000);
+
+        // 会话/历史恢复不阻塞官方加载态；等待有上限，超时先照常请求。
+        var requestSession = await waitRequestSession();
+        if (requestSession && requestSession.id) requestSessionId = requestSession.id;
+        captureAssistant(requestSession);
+        if (ac.signal.aborted || (init.signal && init.signal.aborted)) {
+          throw self.abortError();
+        }
+        if (requestSessionId) DCP.emit('session:activity', eventMeta({ state: 'generating' }));
+        try {
+          var canRecover = !search || typeof search.isRequestCurrent !== 'function' ||
+            search.isRequestCurrent({ requestId: requestCtx.requestId, sessionId: requestSessionId });
+          var recovered = canRecover && requestSession
+            ? await search.recoverBridgeRequest(body.messages, requestSession)
+            : null;
+          if (recovered && recovered.messages) {
+            body = Object.assign({}, body, { messages: recovered.messages });
+            outbound = self.buildOutbound(body, init.headers || {});
+            self._firstUser = self.firstUserText(body.messages);
+            console.log('[DCP] recovered interrupted bridge history', {
+              sessionId: recovered.sessionId,
+              targetId: recovered.targetId,
+              status: recovered.status,
+              mode: recovered.mode,
+              recoveredMessages: recovered.recoveredMessages,
+              recoveredBlocks: recovered.recoveredBlocks
+            });
+          }
+        } catch (e) {
+          console.warn('[DCP] recover bridge history failed', e);
+        }
+        if (ac.signal.aborted || (init.signal && init.signal.aborted)) {
+          throw self.abortError();
+        }
+        // 附件缓存就绪不阻塞首条 message_start，但必须阻塞第一次上游请求。
+        // waitForFiles 自身不 reject；这里再用主 signal 保证用户停止可立即打断。
+        var fileIds = self.outboundFileIds(body.messages);
+        var demoApi = DCP.modules && DCP.modules.demoApi;
+        if (fileIds.length && demoApi && typeof demoApi.waitForFiles === 'function') {
+          try {
+            await self.raceAbort(demoApi.waitForFiles(fileIds, self.FILE_WAIT_TIMEOUT_MS), ac.signal);
+            outbound = self.buildOutbound(body, init.headers || {});
+            self._firstUser = self.firstUserText(body.messages);
+          } catch (waitError) {
+            if (Utils.isAbortError(waitError)) throw waitError;
+          }
+        }
         // 工具循环：与原生行为一致——模型持续调用工具就持续供给结果，
         // 直到它自己停止调用（给出最终文本回答）。不设轮数上限、不加
         // 无进展检测之类的认为中断；需要停止时用页面自身的停止按钮
@@ -796,8 +1219,13 @@ var DemoBridge = {
         var refreshRequestSession = async function () {
           if (!search || typeof search.refreshRequestSession !== 'function' || !requestCtx) return;
           var before = requestSessionId;
-          var s = await search.refreshRequestSession(requestCtx);
+          var s = await Utils.withTimeout(
+            search.refreshRequestSession(requestCtx),
+            self.SESSION_REFRESH_TIMEOUT_MS,
+            'session refresh timed out'
+          ).catch(function () { return null; });
           if (s && s.id) requestSessionId = s.id;
+          captureAssistant(s);
           // 新对话首条消息的 ID 往往到工具轮后才落盘；补发一次带 ID 的生成中
           // 事件，侧栏与其它标签才能把转圈挂到正确的会话行。
           if (requestSessionId && requestSessionId !== before) {
@@ -835,11 +1263,11 @@ var DemoBridge = {
         while (true) {
           var requestBody = Object.assign({}, outbound.body, { messages: messages });
           var payload = JSON.stringify(requestBody);
-          var resp = await self.nativeFetch()(outbound.url, {
+          var resp = await self.fetchWithDeadline(outbound.url, {
             method: 'POST', signal: ac.signal,
             headers: Object.assign({ 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, outbound.headers),
             body: payload
-          });
+          }, self.MAIN_HEADERS_TIMEOUT_MS);
           if (!resp.ok) {
             var et = await resp.text().catch(function () { return ''; });
             var em = et; try { var ej = JSON.parse(et); em = (ej.error && ej.error.message) || et; } catch (e) {}
@@ -853,10 +1281,9 @@ var DemoBridge = {
                 return acc;
               }, {})
             });
-            push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: '模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200) } }));
-            tpsIdle('error');
-            endRequest();
-            finish(); return;
+            emitFailure('模型端点错误 ' + resp.status + '：' + String(em).slice(0, 200), usage);
+            finalize('error', hasVisibleContent ? 'done' : 'error', hasVisibleContent ? 'max_tokens' : null, true);
+            return;
           }
           var blocks = [];       // 本轮完整块（供下一轮历史）
           var partial = {};      // index → 累积 input_json
@@ -874,6 +1301,7 @@ var DemoBridge = {
               if (typeof u[k] === 'number' && (roundUsage[k] == null || u[k] > 0)) roundUsage[k] = u[k];
             });
           };
+          roundSawDelta = false;
           await self.pump(resp.body, function (j) {
             if (j.type === 'message_start' && j.message && j.message.model) respModel = j.message.model;
             if (j.type === 'message_start') {
@@ -895,6 +1323,8 @@ var DemoBridge = {
               var b = { type: cb.type, raw: cb, index: nextIdx() };
               blocks.push(b); partial[b.index] = '';
               if (cb.type === 'text' || cb.type === 'thinking' || cb.type === 'tool_use') {
+                openBlocks[b.index] = true;
+                if (cb.type === 'text' && cb.text) hasVisibleContent = true;
                 push(self.sseEvent('content_block_start', { type: 'content_block_start', index: b.index, content_block: cb }));
               }
             } else if (j.type === 'content_block_delta') {
@@ -911,24 +1341,32 @@ var DemoBridge = {
               }
               if (d.type === 'text_delta' || d.type === 'thinking_delta' || d.type === 'signature_delta') {
                 if (blk.type === 'tool_use') return;
-                if (d.type === 'text_delta') tps.liveTokens += Utils.estimateTokens(d.text || '');
-                else if (d.type === 'thinking_delta') tps.liveTokens += Utils.estimateTokens(d.thinking || '');
+                if (d.type === 'text_delta') {
+                  tps.liveTokens += Utils.estimateTokens(d.text || '');
+                  if (d.text) hasVisibleContent = true;
+                } else if (d.type === 'thinking_delta') tps.liveTokens += Utils.estimateTokens(d.thinking || '');
                 push(self.sseEvent('content_block_delta', { type: 'content_block_delta', index: blk.index, delta: d }));
               }
             } else if (j.type === 'content_block_stop') {
               var b2 = blocks[blocks.length - 1];
               if (b2) {
+                delete openBlocks[b2.index];
                 if (b2.type === 'tool_use') {
                   try { b2.raw.input = JSON.parse(partial[b2.index] || '{}'); } catch (e) { b2.raw.input = {}; }
                 }
                 push(self.sseEvent('content_block_stop', { type: 'content_block_stop', index: b2.index }));
               }
             } else if (j.type === 'message_delta') {
+              if (!j.delta || ['end_turn', 'max_tokens', 'tool_use', 'refusal'].indexOf(j.delta.stop_reason) === -1) {
+                throw new Error('模型响应缺少有效的 stop_reason');
+              }
+              roundSawDelta = true;
               mergeUsage(j.usage);
               if (j.delta && j.delta.stop_reason) roundStop = j.delta.stop_reason;
               tpsEmit();
             }
           }, ac.signal);
+          if (!roundSawDelta) throw new Error('模型响应在完成前中断');
           // 本轮结束：记进请求累计并立刻发一次。此时多半已拿到接口 usage 的精确
           // output_tokens；没有则退回估算值并保留 estimated:true，界面不会误标成
           // 接口精确值
@@ -946,6 +1384,9 @@ var DemoBridge = {
               leg = await self.runLeg(tu.raw.name, tu.raw.input || {}, dsKey, push, nextIdx, ac.signal, tu.raw.id, toolRoundIndex);
               addUsage(leg.usage);
             } catch (le) {
+              // 用户停止不是“搜索失败”：AbortError（或主 signal 已中止）必须
+              // 立即抛回统一 finalize，不能合成 search_unavailable 块。
+              if (Utils.isAbortError(le) || ac.signal.aborted) throw le;
               // 腿失败 → 原生失败形状的搜索块 + 空结果喂回。id 必须配对：
               // 旧版结果固定用 srvtoolu_b_x，而调用块是随机 id，官方会话会
               // 出现连续 user(tool_result)，下一次请求直接变成非法消息序列。
@@ -993,25 +1434,31 @@ var DemoBridge = {
           }
           if (title) delta.title = title;
         }
+        closeOpenBlocks();
         push(self.sseEvent('message_delta', { type: 'message_delta', delta: delta, usage: usage }));
         push(self.sseEvent('message_stop', { type: 'message_stop' }));
-        tpsIdle('done');
+        finalize('done', 'done', sr, false);
       } catch (e) {
-        tpsIdle(e && e.name === 'AbortError' ? 'stopped' : 'error');
-        if (e && e.name === 'AbortError') { finish(); endRequest(); return; }
-        push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
+        if (Utils.isAbortError(e)) {
+          finalize('stopped', 'stopped', null, true);
+          return;
+        }
+        var kept = emitFailure(e && e.message || e, usage);
+        if (kept) {
+          if (!detached) Utils.toast(DCP.t('连接中断，已保留生成内容，可点击继续生成'), 4200);
+          console.warn('[DCP] stream interrupted; marked partial answer as max_tokens for continuation', e);
+        }
+        finalize('error', kept ? 'done' : 'error', kept ? 'max_tokens' : null, true);
       }
-      finish();
-      endRequest();
     })().catch(function (e) {
       // title leg 初始化、ReadableStream 构造等主 try 之前的异常也必须收口，
       // 否则页面会一直停在“停止生成”，既看不到 error 也不关流。
-      tpsIdle(e && e.name === 'AbortError' ? 'stopped' : 'error');
-      if (!(e && e.name === 'AbortError')) {
-        push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
+      if (Utils.isAbortError(e)) {
+        finalize('stopped', 'stopped', null, true);
+        return;
       }
-      finish();
-      endRequest();
+      push(self.sseEvent('error', { type: 'error', error: { type: 'api_error', message: String(e && e.message || e).slice(0, 200) } }));
+      finalize('error', 'error', null, true);
     });
 
     return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache' } });

@@ -10,11 +10,11 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.21-4D6BFE" alt="version 1.0.21">
+  <img src="https://img.shields.io/badge/version-1.0.24-4D6BFE" alt="version 1.0.24">
   <img src="https://img.shields.io/badge/license-MIT-22c55e" alt="license MIT">
   <img src="https://img.shields.io/github/stars/dongyu23/deepseek-unlimited?style=flat&color=4D6BFE" alt="GitHub stars">
   <img src="https://img.shields.io/badge/Tampermonkey-4.x%2B-f59e0b" alt="Tampermonkey 4.x+">
-  <img src="https://img.shields.io/badge/userscript-280KB-6366f1" alt="script size">
+  <img src="https://img.shields.io/badge/userscript-400KB-6366f1" alt="script size">
 </p>
 
 > 2026-11-16 起，DeepSeek 因算力紧张对 **C 端免费用户**实施限额：超 7 天不活跃的长对话不能续、单次输入从 8 万字砍到 **4 万字**、每日对话额度触顶后只回「服务器繁忙，使用额度已达上限」——相关话题连续登上热搜。
@@ -39,6 +39,9 @@
 | **图片与文件** | 文本文件内联；图片转 base64 内联；可按模型是否多模态分别处理 |
 | **上下文占用环** | 输入框旁实时显示 占用/窗口 百分比，悬浮面板给构成占比与缓存命中率（总量与命中率取自接口 usage，是精确值） |
 | **思考实时秒表** | 发送后思考标题实时显示已用秒数，结束后保留官方“已思考（用时 n 秒）” |
+| **断流续接** | 中途断流不再伪装成正常结束；保留已生成内容并提供“继续生成”，搜索块场景也会显示继续入口 |
+| **会话切换保活** | 切换会话不再取消原会话正在进行的请求；后台继续生成并落盘，停止按钮仍可立即中断当前生成 |
+| **编辑体验** | 编辑已发送消息时自动聚焦到句末，主输入框工具条不会误附着到编辑框 |
 | **官网交互动画** | 侧栏 300ms 展开/收起，弹窗与菜单 100ms 淡入缩放，支持减少动态效果偏好 |
 | **跨标签会话同步** | 侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文；刷新只恢复一次当前会话 |
 | **代码块下载** | 在原生“复制”旁补“下载”，按语言保存为 py/js/ts/sh/json 等文件 |
@@ -75,7 +78,7 @@
 
 - 脚本只作用于 `https://cdn.deepseek.com/chat-demo`，不影响官网其它页面。
 - **搜索腿和起名腿用的是页面自己设置里填的那把官方 Key**，不是你配的第三方 Key。demo 页要能搜索，得先在页面左上角「设置」里填好官方 API Key；没填时主对话照常，只是搜索/起名会失败。
-- 不依赖 `GM_xmlhttpRequest`，没有油猴能力的环境（WebView / 内嵌浏览器注入）会自动改用 localStorage 存配置。
+- 不依赖 `GM_xmlhttpRequest`。有脚本管理器隔离存储时配置保存在管理器内；没有隔离存储的注入方式只把非敏感配置保存在页面存储，API Key 仅保留在当前页面内存。
 
 ### 配置项
 
@@ -84,6 +87,7 @@
 | API 端点 | Base URL 或完整地址；留空 = 官方 `api.deepseek.com/anthropic/v1` |
 | API Key | 第三方端点必填；只有精确官方 `api.deepseek.com` 端点可留空并使用页面官方 Key |
 | 模型 | 留空 = 官方默认 |
+| 界面语言 | `auto` / `zh` / `en`，默认跟随系统与页面语言 |
 | 多模态 | 开 = 图片转 base64 内联；关 = 只发「当前模型不支持图片」的文字说明 |
 | 工具调用方式 | `native` / `searchapi`，**同时决定了搜索来源**（见下） |
 | 上下文窗口 | 占用环百分比的分母，支持 `128000` / `128k` / `1m` |
@@ -139,13 +143,13 @@
 | 环境 | 状态 |
 |---|---|
 | Chrome / Edge / Comet + Tampermonkey 4.x+ | ✅ 日常使用 |
-| 无油猴能力的注入方式（WebView / 内嵌浏览器） | ✅ 实测：自动回退 localStorage 存配置，功能完整 |
+| 无油猴能力的注入方式（WebView / 内嵌浏览器） | ⚠️ 配置可用；无隔离存储时 API Key 仅保留在内存，刷新后需重新填写 |
 | 只依赖 `@match` 与 `GM_*`（不用 `GM_xmlhttpRequest`） | ✅ 跨管理器干扰最小 |
 | Greasemonkey / 手机浏览器 / 其它管理器 | ⚠️ 未实测 |
 
 ## 隐私与安全
 
-- **API Key 只存在你自己浏览器的本地存储**（油猴 `GM_*` 或 `localStorage`）。脚本不发送任何遥测，除了「你配置的端点」和「DeepSeek 官方接口」不连接任何服务器。
+- **API Key 优先保存在脚本管理器的隔离存储中**。注入方式没有隔离存储时只保留在当前页面内存，不写入页面可读的 localStorage，刷新后需要重新填写。脚本不发送任何遥测，除了「你配置的端点」和「DeepSeek 官方接口」不连接任何服务器。
 - 请求去向：主对话 → 你配置的端点；搜索腿 / 起名腿 → `api.deepseek.com`（用页面自带的官方 Key）。
 - 跨标签同步只走同源 `BroadcastChannel`（不可用时用 `localStorage` 事件），广播里只有会话 ID、标题、时间和生成状态，没有消息正文或 API Key。
 - 附件预览只在本地读取 blob URL；图片、PDF、文本直接显示，Office 等不支持的类型只提供下载，不会上传到第三方预览服务。
@@ -159,15 +163,17 @@
 - 模型质量与额度取决于你选的服务商；脚本只负责让 demo 页「说上话」。
 - 工具块不会被服务端清洗，连续搜索时上下文涨得比官网快（官网由 DeepSeek 服务端自清洗）。
 - 刷新页面无法续传未完成的生成（官方站可以）。跨标签同步只同步状态和已落盘内容；后台标签会在对方完成后自动重载一次并回到原会话。
+- 上游网络真正中断时，脚本不会盲目重发整条回答；已输出内容会保留为可继续的截断状态，点击“继续生成”后从断点恢复。
 
 ## 开发
 
 ```bash
-node build.js     # 拼接 src/ → deepseek-unlimited.user.js（约 280KB）
+npm test          # Node 内置测试（无需安装依赖）
+npm run build     # 拼接 src → deepseek-unlimited.user.js（约 400KB）
 ```
 
 - `src/core/` — 配置 / 选择器 / 工具 / i18n
-- `src/modules/` — 请求改写与设置面板、工具桥接、占用环、会话搜索、跨标签同步、思考秒表、官网动画、代码下载、会话置顶、附件预览、粘贴转 txt、标签页标题、工具条定位
+- `src/modules/` — 请求改写与设置面板、工具桥接、占用环、会话搜索、跨标签同步、思考秒表、官网动画、断流续接、编辑光标、代码下载、会话置顶、附件预览、粘贴转 txt、标签页标题、工具条定位
 - `src/assets/official-logo.svg` — 左上角官方标识（构建时内联）
 - `docs/logo.png` — 项目标识（512×512，README 与脚本 `@icon` 都用它）
 

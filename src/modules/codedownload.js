@@ -1,8 +1,8 @@
 /* ============================================================
  * modules/codedownload：代码块下载
  *
- * demo 原生代码块只有“复制”。这里在横幅里补一个同风格“下载”按钮，
- * 按语言扩展名保存当前 <pre> 的完整文本；不移动官方节点、不改代码内容。
+ * 在原生代码块横幅里补一个同风格“下载”按钮；复制按钮按中英文 label
+ * 定位，注入按钮带 data-dcp-owned，避免观察器自我触发。
  * ============================================================ */
 var CodeDownload = {
   ICON: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
@@ -23,43 +23,60 @@ var CodeDownload = {
   },
 
   languageOf: function (block) {
-    var banner = block.querySelector('.md-code-block-banner');
+    var banner = DCP.qs('codeBanner', block);
     if (!banner) return '';
     var named = banner.querySelector('[class*="name-"]');
     if (named && named.textContent) return named.textContent.trim().toLowerCase();
     var text = (banner.textContent || '').trim();
     if (!text) return '';
-    // 横幅里通常只有一个语言名；复制按钮出现后也只取第一段
     return text.split(/\s+/)[0].toLowerCase();
   },
 
   extOf: function (lang) {
     lang = String(lang || '').toLowerCase();
-    if (this.EXT[lang]) return this.EXT[lang];
+    if (UI.own(this.EXT, lang)) return this.EXT[lang];
     if (/^[a-z0-9_+-]{1,16}$/.test(lang)) return lang;
     return 'txt';
   },
 
+  copyButton: function (banner) {
+    return UI.findByLabels(banner, ['复制', 'Copy', '复制代码', 'Copy code'], 'button', false);
+  },
+
+  updateButton: function (btn) {
+    if (!btn) return;
+    var label = DCP.t('下载代码');
+    UI.setAttributeIfChanged(btn, 'aria-label', label);
+    UI.setAttributeIfChanged(btn, 'title', label);
+    var text = btn.querySelector('span');
+    UI.setTextIfChanged(text, DCP.t('下载'));
+    UI.markOwned(btn);
+  },
+
   ensure: function (block) {
-    if (!block || block.querySelector('.dcp-code-download')) return;
-    var banner = block.querySelector('.md-code-block-banner');
-    if (!banner) return;
-    var copy = Array.prototype.slice.call(banner.querySelectorAll('button')).find(function (b) {
-      return /复制/.test(b.textContent || b.getAttribute('aria-label') || '');
-    });
-    if (!copy) return;
+    if (!block) return false;
+    var existing = block.querySelector('.dcp-code-download');
+    if (existing && existing.isConnected) {
+      this.updateButton(existing);
+      return false;
+    }
+    var banner = DCP.qs('codeBanner', block);
+    if (!banner) return false;
+    var copy = this.copyButton(banner);
+    if (!copy) return false;
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = copy.className + ' dcp-code-download';
-    btn.setAttribute('aria-label', DCP.t('下载代码'));
-    btn.title = DCP.t('下载代码');
     btn.innerHTML = this.ICON + '<span>' + DCP.t('下载') + '</span>';
+    this.updateButton(btn);
     var self = this;
     btn.addEventListener('click', function (e) {
-      e.preventDefault(); e.stopPropagation();
+      e.preventDefault();
+      e.stopPropagation();
       self.download(block);
     }, true);
     copy.insertAdjacentElement('afterend', btn);
+    return true;
   },
 
   download: function (block) {
@@ -71,27 +88,42 @@ var CodeDownload = {
     var blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
-    a.href = url; a.download = name;
+    a.href = url;
+    a.download = name;
     document.body.appendChild(a);
-    a.click(); a.remove();
+    a.click();
+    a.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
     Utils.toast(DCP.t('已下载 {name}', { name: name }), 1600);
   },
 
   scan: function () {
-    var blocks = document.querySelectorAll('.md-code-block');
+    var blocks = DCP.qsa('codeBlock');
     for (var i = 0; i < blocks.length; i++) {
       try { this.ensure(blocks[i]); } catch (e) {}
     }
   },
 
   init: function () {
+    if (this._inited) return;
+    this._inited = true;
+    if (!this._styleInjected) {
+      this._styleInjected = true;
+      DCP.bridge.addStyle('.dcp-code-download:focus-visible{outline:2px solid var(--dcp-accent,#3b6cf6);outline-offset:2px}');
+    }
     var self = this;
     Utils.onReady(function () {
       self.scan();
-      new MutationObserver(Utils.throttle(function () { self.scan(); }, 120))
-        .observe(document.body, { childList: true, subtree: true });
+      self._observer = UI.observeRelevant(document.body, function () { self.scan(); }, {
+        childList: true,
+        subtree: true
+      });
     });
+  },
+
+  destroy: function () {
+    if (this._observer) this._observer.disconnect();
+    this._observer = null;
   }
 };
 DCP.modules.codeDownload = CodeDownload;

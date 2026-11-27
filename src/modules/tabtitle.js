@@ -29,16 +29,16 @@ var TabTitle = {
       self.bind();
       // 兜底自愈：聊天区容器整体被换掉（切会话）时重新绑。节流（带前缘）而非
       // 防抖——防抖会被连续 DOM 变动不断重置，重建后迟迟不生效
-      new MutationObserver(Utils.throttle(function () {
+      self._observer = UI.observeRelevant(document.body, function () {
         if (!self._host || !self._host.isConnected) self.bind();
         self.sync();
-      }, 100)).observe(document.body, { childList: true, subtree: true });
+      }, { childList: true, subtree: true });
     });
   },
 
   // 当前会话名 → "会话名 - DeepSeek"；无标题/新对话 → 页面原标题
   sync: function () {
-    var el = document.querySelector(DCP.SEL.chatTitle);
+    var el = DCP.qs('chatTitle');
     var t = el ? String(el.textContent || '').trim() : '';
     if (this.PLACEHOLDERS.indexOf(t) !== -1) t = '';
     var want = t ? t + ' - ' + this.BRAND : this.orig;
@@ -48,15 +48,18 @@ var TabTitle = {
   // 精确观察器绑在聊天区标题的父容器上：childList 管元素出现/消失（新对话）、
   // subtree+characterData 管标题文本变化（改名）
   bind: function () {
-    var el = document.querySelector(DCP.SEL.chatTitle);
-    var host = (el && el.parentElement) || document.querySelector(DCP.SEL.chatHeader) ||
-               document.querySelector(DCP.SEL.chatView);
+    var el = DCP.qs('chatTitle');
+    var host = (el && el.parentElement) || DCP.qs('chatHeader') || DCP.qs('chatView');
     if (!host) return;
+    if (this._mo && this._host === host && host.isConnected) return;
     if (this._mo) { try { this._mo.disconnect(); } catch (e) {} }
     this._host = host;
     var self = this;
-    this._mo = new MutationObserver(Utils.throttle(function () { self.sync(); }, 50));
-    this._mo.observe(host, { childList: true, subtree: true, characterData: true });
+    this._mo = UI.observeRelevant(host, Utils.debounce(function () { self.sync(); }, 50), {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
   }
 };
 DCP.modules.tabTitle = TabTitle;

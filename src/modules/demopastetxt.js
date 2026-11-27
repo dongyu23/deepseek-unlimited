@@ -1,240 +1,416 @@
 /* ============================================================
  * modules/demoPasteTxt：复刻官方「粘贴大段文本自动转成 txt 附件」
  *
- * 官方行为（2026-11-18 从主站 chat-main.js 逐字提取）：
- *   - 触发条件是**粘贴**，不是打字；剪贴板里带文件项时整段逻辑不介入
- *   - 阈值 = 服务端 file_feature.paste_text_to_file_character_limit，
- *     取不到时默认 2000；判的是「粘贴文本自身长度 > 阈值」
- *   - 还要 canAddFile（上传可用且文件数没满），否则照常按文本粘贴
- *   - 转成 File 后走页面上传管线：附件卡、上传、document 内容块全原生
- *   - 文件名：首行 → 超 50 字符截断（ASCII 词边界回退）→ 去非法字符 →
- *     折叠空白 → 空则用「粘贴的文本」→ 拼 .txt
- *   - 上传没成功时把文本还回输入框并提示；Ctrl+Z 可撤销这次转换
- *
- * demo 页（cdn.deepseek.com/chat-demo）bundle 里没有这段逻辑，但上传管线
- * 是齐的——隐藏 <input type="file"> 的 onChange 就是上传入口。所以本模块
- * **不重画任何 UI**：把 File 塞进那个 input 再派发 change，让页面自己上传、
- * 自己渲染附件卡。主站（chat.deepseek.com）原生就有这功能，不介入。
+ * 每次转换都是一个 operation/session/input-version 事务。只有仍处于同一
+ * 会话、同一输入框且输入版本未变化时才恢复文本或记录撤销；轮询可取消，
+ * 附件卡按文件名精确关联，避免把并发上传的其它卡片当成本次结果。
  * ============================================================ */
 var DemoPasteTxt = {
-  // 官方默认阈值（服务端没配 paste_text_to_file_character_limit 时）
   LIMIT: 2000,
-  // 上传结果轮询：卡片出现算成功，超时算失败（走官方「还回输入框」分支）
-  POLL_MS: 100, POLL_TIMEOUT: 4000,
+  POLL_MS: 100,
+  POLL_TIMEOUT: 4000,
 
-  /* ---------- 定位（不依赖哈希 class，用结构关系） ---------- */
-  // 上传 input：accept 里带 .txt 且可多选——demo 页有两个 file input，
-  // 另一个是 image/* 单选，不会误取
+  _bound: new WeakSet(),
+  _versions: new WeakMap(),
+  _active: null,
+  _rec: null,
+  _internalInput: null,
+  _observer: null,
+  _operationSequence: 0,
+
+  /* ---------- 定位 ---------- */
   findInput: function () {
-    var list = document.querySelectorAll('input[type="file"]');
-    for (var i = 0; i < list.length; i++) if (/\.txt/.test(list[i].accept || '')) return list[i];
+    var list = DCP.qsa('input[type="file"]');
+    for (var i = 0; i < list.length; i++) {
+      if (/\.txt/i.test(list[i].accept || '')) return list[i];
+    }
     return null;
   },
 
-  // 上传按钮：从隐藏 input 往前找最近的一个按钮（它包在 tooltip 的 trigger
-  // span 里也没关系，取 span 内的 button）——与 aria-label 的本地化文案无关，
-  // 也不依赖 class 哈希
   findUploadBtn: function (input) {
-    var n = input ? input.previousElementSibling : null;
-    while (n) {
-      if (n.tagName === 'BUTTON') return n;
-      var b = n.querySelector ? n.querySelector('button') : null;
-      if (b) return b;
-      n = n.previousElementSibling;
+    var node = input ? input.previousElementSibling : null;
+    while (node) {
+      if (node.tagName === 'BUTTON') return node;
+      var button = node.querySelector ? node.querySelector('button') : null;
+      if (button) return button;
+      node = node.previousElementSibling;
     }
     return null;
   },
 
-  // 输入区：从 input 往上走到第一个含 textarea 的容器（附件卡/输入框/功能行
-  // 都在这个容器里）
   findComposer: function (input) {
-    var n = input;
-    while (n && n !== document.body) {
-      if (n.querySelector && n.querySelector('textarea')) return n;
-      n = n.parentElement;
+    var node = input;
+    while (node && node !== document.body) {
+      if (node.querySelector && node.querySelector('textarea')) return node;
+      node = node.parentElement;
     }
     return null;
   },
 
-  // 附件卡列表。注意：**0 个卡片时页面连 attachments 容器都不渲染**，所以不能
-  // 先找容器再数子元素（会永远是 0，导致误判"上传失败"而把文本还回输入框）。
-  // 改成直接按 card- 前缀找，再用「卡内必有删除按钮」过滤掉误匹配
   cardList: function (composer) {
     if (!composer) return [];
-    var all = composer.querySelectorAll('[class*="card-"]');
-    var out = [];
-    for (var i = 0; i < all.length; i++) if (all[i].querySelector('button')) out.push(all[i]);
-    return out;
+    return DCP.qsa('fileCard', composer).filter(function (card) {
+      return !!(card.querySelector && (card.querySelector('button') || card.querySelector('a[download]')));
+    });
   },
 
   countCards: function (composer) {
     return this.cardList(composer).length;
   },
 
+  /* ---------- 版本与事务 ---------- */
+  getVersion: function (ta) {
+    if (!ta) return 0;
+    return this._versions.get(ta) || 0;
+  },
+
+  bumpVersion: function (ta) {
+    if (!ta) return 0;
+    var next = this.getVersion(ta) + 1;
+    this._versions.set(ta, next);
+    return next;
+  },
+
+  invalidateUndo: function (ta) {
+    if (this._rec && (!ta || this._rec.ta === ta)) this._rec = null;
+  },
+
+  isOperationCurrent: function (op) {
+    return !!(op && !op.cancelled && op.epoch === UI.sessionEpoch() && op.sid === UI.currentSid() &&
+      op.composer && op.composer.isConnected && op.ta && op.ta.isConnected);
+  },
+
+  isRecordCurrent: function (rec) {
+    return !!(rec && this.isOperationCurrent(rec) && rec.card && rec.card.isConnected &&
+      this.getVersion(rec.ta) === rec.inputVersion);
+  },
+
+  cancelOperation: function (op) {
+    if (!op) return;
+    op.cancelled = true;
+    if (op.pollTimer) clearTimeout(op.pollTimer);
+    op.pollTimer = null;
+    if (typeof op.resolveFeed === 'function') {
+      var resolve = op.resolveFeed;
+      op.resolveFeed = null;
+      resolve({ ok: false, card: null, cancelled: true });
+    }
+    if (this._active === op) this._active = null;
+  },
+
+  cancelActive: function () {
+    if (this._active) this.cancelOperation(this._active);
+  },
+
+  resetSession: function () {
+    this.cancelActive();
+    this._rec = null;
+    this._internalInput = null;
+  },
+
   /* ---------- 粘贴判定 ---------- */
   onPaste: function (e) {
     var cd = e.clipboardData;
     if (!cd) return;
-    // 剪贴板带文件项 → 官方整体不介入，交给浏览器默认行为
     var items = cd.items;
-    if (items) for (var i = 0; i < items.length; i++) if (items[i].kind === 'file') return;
+    if (items) {
+      for (var i = 0; i < items.length; i++) {
+        if (items[i] && items[i].kind === 'file') return;
+      }
+    }
     var text = cd.getData('text/plain');
     if (!text) return;
+    var ta = e.currentTarget;
+    if (!ta || ta.tagName !== 'TEXTAREA') return;
+    if (ta.matches && ta.matches(DCP.SEL.msgEditor)) return;
     var input = this.findInput();
     if (!input) return;
     var composer = this.findComposer(input);
-    if (!composer) return;
-    var ta = e.currentTarget;
-    var s0 = ta.selectionStart, s1 = ta.selectionEnd;
-    // canAddFile：读页面上传按钮自己的禁用态（文件数满/当前不可上传时页面
-    // 会禁用它）——不自己猜上限，上限只有页面知道
+    if (!composer || !composer.contains(ta)) return;
     var btn = this.findUploadBtn(input);
     if (!btn || btn.disabled) return;
-    // 官方还有一条 inputMaxLength 分支（超长直接按文本粘 + 弹计数提示），
-    // 但那个上限来自服务端 input_character_limit；demo 页没有该配置，
-    // 官方代码里是 `void 0 !== a` 判定，取不到时整条分支跳过——同样跳过
     if (text.length <= this.LIMIT) return;
 
     e.preventDefault();
-    var delInUndo = this.deleteSelection(ta, s0, s1);
-    var file = new File([text], this.txtName(text), { type: 'text/plain;charset=utf-8' });
-    var self = this;
+    this.cancelActive();
     this._rec = null;
-    this.feed(input, file, composer, function (ok, card) {
-      if (!ok) {
-        // 官方失败分支：文本还回输入框 + 提示，绝不让用户丢字
-        self.insertText(ta, text, s0);
+    var s0 = ta.selectionStart;
+    var s1 = ta.selectionEnd;
+    var op = {
+      id: ++this._operationSequence,
+      epoch: UI.sessionEpoch(),
+      sid: UI.currentSid(),
+      composer: composer,
+      input: input,
+      ta: ta,
+      text: text,
+      at: s0,
+      cancelled: false,
+      pollTimer: null,
+      resolveFeed: null,
+      startedAt: Date.now()
+    };
+    this._active = op;
+    var delInUndo = false;
+    this._internalInput = ta;
+    try {
+      delInUndo = this.deleteSelection(ta, s0, s1);
+    } finally {
+      this._internalInput = null;
+    }
+    op.delInUndo = delInUndo;
+    this.bumpVersion(ta);
+    op.inputVersion = this.getVersion(ta);
+
+    var file;
+    try {
+      file = new File([text], this.txtName(text), { type: 'text/plain;charset=utf-8' });
+    } catch (err) {
+      if (this.isOperationCurrent(op) && this.getVersion(ta) === op.inputVersion) {
+        this.insertText(ta, text, s0, false);
+      }
+      this.cancelOperation(op);
+      return;
+    }
+    op.file = file;
+    var self = this;
+    this.feed(input, file, composer, op).then(function (result) {
+      if (self._active === op) self._active = null;
+      if (!result || !result.ok || result.cancelled) {
+        if (!result || result.cancelled || !self.isOperationCurrent(op)) return;
+        if (self.getVersion(ta) !== op.inputVersion) return;
+        self.insertText(ta, text, s0, false);
         Utils.toast(DCP.t('内容已恢复到输入框'));
         return;
       }
-      // 记下这次转换供 Ctrl+Z 撤销（官方同款：撤销=删卡片+文本回输入框）
-      self._rec = { kind: 'converted', text: text, at: s0, card: card, delInUndo: delInUndo, composer: composer };
+      if (!self.isOperationCurrent(op) || self.getVersion(ta) !== op.inputVersion) return;
+      self._rec = {
+        kind: 'converted',
+        text: text,
+        at: s0,
+        card: result.card,
+        delInUndo: delInUndo,
+        composer: composer,
+        input: input,
+        ta: ta,
+        epoch: op.epoch,
+        sid: op.sid,
+        inputVersion: op.inputVersion,
+        cancelled: false
+      };
     });
   },
 
-  /* ---------- 选区删除（官方同款：先 execCommand，失败再走 setValue） ---------- */
+  /* ---------- 选区删除 ---------- */
+  setNativeValue: function (ta, value) {
+    var setter = null;
+    try {
+      setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+    } catch (e) {}
+    if (setter) setter.call(ta, value);
+    else ta.value = value;
+  },
+
   deleteSelection: function (ta, s0, s1) {
     if (s0 === s1) return false;
     ta.focus();
-    if (document.activeElement === ta && document.execCommand('delete', false)) return true;
-    var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-    var v = ta.value;
-    setter.call(ta, v.slice(0, s0) + v.slice(s1));
+    if (document.activeElement === ta && document.execCommand && document.execCommand('delete', false)) return true;
+    this.setNativeValue(ta, ta.value.slice(0, s0) + ta.value.slice(s1));
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     ta.setSelectionRange(s0, s0);
     return false;
   },
 
   /* ---------- 把 File 交给页面上传管线 ---------- */
-  feed: function (input, file, composer, cb) {
-    var before = this.countCards(composer);
-    var dt = new DataTransfer();
-    dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    var self = this, t0 = Date.now();
-    (function poll() {
-      var list = self.cardList(composer);
-      if (list.length > before) return cb(true, list[list.length - 1]);
-      if (Date.now() - t0 > self.POLL_TIMEOUT) return cb(false, null);
-      setTimeout(poll, self.POLL_MS);
-    })();
+  cardName: function (card) {
+    if (!card) return '';
+    var link = card.querySelector ? card.querySelector('a[download]') : null;
+    return String(card.getAttribute('title') || card.getAttribute('data-file-name') ||
+      (link && link.getAttribute('download')) || card.getAttribute('aria-label') || '').trim();
+  },
+
+  cardMatchesFile: function (card, file) {
+    if (!card || !file) return false;
+    var name = this.cardName(card);
+    return !!name && name === String(file.name || '');
+  },
+
+  findCardForOperation: function (op) {
+    var cards = this.cardList(op.composer);
+    var matches = [];
+    for (var i = 0; i < cards.length; i++) {
+      var card = cards[i];
+      if (op.beforeCards && op.beforeCards.has(card)) continue;
+      if (this.cardMatchesFile(card, op.file)) matches.push(card);
+    }
+    return matches.length === 1 ? matches[0] : null;
+  },
+
+  feed: function (input, file, composer, op) {
+    op.beforeCards = new Set(this.cardList(composer));
+    try {
+      var dt = new DataTransfer();
+      dt.items.add(file);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e) {
+      return Promise.resolve({ ok: false, card: null, cancelled: false });
+    }
+    var self = this;
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(result) {
+        if (settled) return;
+        settled = true;
+        if (op.pollTimer) clearTimeout(op.pollTimer);
+        op.pollTimer = null;
+        op.resolveFeed = null;
+        resolve(result);
+      }
+      op.resolveFeed = finish;
+      (function poll() {
+        if (settled) return;
+        if (!self.isOperationCurrent(op)) return finish({ ok: false, card: null, cancelled: true });
+        var card = self.findCardForOperation(op);
+        if (card) return finish({ ok: true, card: card });
+        if (Date.now() - op.startedAt > self.POLL_TIMEOUT) {
+          return finish({ ok: false, card: null, cancelled: false });
+        }
+        op.pollTimer = setTimeout(poll, self.POLL_MS);
+      })();
+    });
   },
 
   /* ---------- 文本写回输入框 ---------- */
-  insertText: function (ta, text, pos) {
-    ta.focus();
-    var p = (pos == null ? ta.value.length : Math.max(0, Math.min(pos, ta.value.length)));
-    if (document.activeElement === ta) {
-      ta.setSelectionRange(p, p);
-      if (document.execCommand('insertText', false, text)) return;
+  insertText: function (ta, text, pos, focus) {
+    if (!ta || !ta.isConnected) return false;
+    if (focus) ta.focus();
+    var at = pos == null ? ta.value.length : Math.max(0, Math.min(pos, ta.value.length));
+    if (focus && document.activeElement === ta && document.execCommand && document.execCommand('insertText', false, text)) {
+      this.bumpVersion(ta);
+      return true;
     }
-    var setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
-    var v = ta.value;
-    setter.call(ta, v.slice(0, p) + text + v.slice(p));
+    this._internalInput = ta;
+    this.setNativeValue(ta, ta.value.slice(0, at) + text + ta.value.slice(at));
     ta.dispatchEvent(new Event('input', { bubbles: true }));
-    requestAnimationFrame(function () { ta.setSelectionRange(p + text.length, p + text.length); });
+    this._internalInput = null;
+    try { ta.setSelectionRange(at + text.length, at + text.length); } catch (e) {}
+    this.bumpVersion(ta);
+    return true;
   },
 
-  /* ---------- Ctrl+Z 撤销这次转换（官方同款） ---------- */
+  /* ---------- Ctrl/Cmd+Z 撤销这次转换 ---------- */
+  isUndoEvent: function (e) {
+    if (String(e.key || '').toLowerCase() !== 'z' || e.altKey || e.shiftKey) return false;
+    var platform = '';
+    try { platform = navigator.platform || navigator.userAgent || ''; } catch (err) {}
+    var mac = /mac|iphone|ipad|ipod/i.test(platform);
+    if (mac) return !!(e.metaKey && !e.ctrlKey);
+    if (platform) return !!(e.ctrlKey && !e.metaKey);
+    return e.ctrlKey !== e.metaKey;
+  },
+
+  deleteButton: function (card) {
+    if (!card) return null;
+    return UI.findByLabels(card, ['删除', '移除', 'Remove', 'Delete'], 'button', true) ||
+      (card.querySelector ? card.querySelector('button') : null);
+  },
+
   onKey: function (e) {
     var rec = this._rec;
-    // 只拦截「紧接着这次转换」的撤销：用户一打字或按别的键，记录即失效，
-    // 之后 Ctrl+Z 交回 textarea 原生撤销，不劫持
     if (!rec) return;
-    var isUndo = (e.metaKey || e.ctrlKey) && !e.altKey && String(e.key).toLowerCase() === 'z' && !e.shiftKey;
-    if (!isUndo) { this._rec = null; return; }
+    if (e.currentTarget !== rec.ta && e.target !== rec.ta) return;
+    if (!this.isRecordCurrent(rec)) {
+      this._rec = null;
+      return;
+    }
+    if (!this.isUndoEvent(e)) {
+      this._rec = null;
+      return;
+    }
     e.preventDefault();
+    e.stopImmediatePropagation();
     this._rec = null;
-    // 删卡片（卡片里唯一的 button 就是删除按钮，aria-label 是本地化的）
-    var rm = rec.card && rec.card.querySelector('button');
-    if (rm) Utils.realClick(rm);
-    // 删除选区时若走了 execCommand（进了原生撤销栈），要连带 undo 一次，
-    // 否则撤销栈里会留下那次删除
-    if (rec.delInUndo) document.execCommand('undo', false);
-    var ta = (rec.composer || document).querySelector('textarea');
-    if (ta) this.insertText(ta, rec.text, rec.at);
+    var remove = this.deleteButton(rec.card);
+    if (remove) Utils.realClick(remove);
+    if (rec.delInUndo && document.execCommand) {
+      this._internalInput = rec.ta;
+      try { document.execCommand('undo', false); } catch (err) {}
+      this._internalInput = null;
+    }
+    if (this.isOperationCurrent(rec) && this.getVersion(rec.ta) === rec.inputVersion) {
+      this.insertText(rec.ta, rec.text, rec.at, false);
+    }
   },
 
   /* ---------- 绑定 ---------- */
   bind: function () {
-    var self = this;
     var input = this.findInput();
     if (!input) return;
     var composer = this.findComposer(input);
     if (!composer) return;
-    var tas = composer.querySelectorAll('textarea');
-    for (var i = 0; i < tas.length; i++) {
-      var ta = tas[i];
-      if (ta.__dsePasteTxt) continue;
-      ta.__dsePasteTxt = true;
+    var self = this;
+    DCP.qsa('textarea', composer).forEach(function (ta) {
+      if (ta.matches && ta.matches(DCP.SEL.msgEditor)) return;
+      if (self._bound.has(ta)) return;
+      self._bound.add(ta);
       ta.addEventListener('paste', function (e) { self.onPaste(e); }, true);
       ta.addEventListener('keydown', function (e) { self.onKey(e); }, true);
-      // 用户一打字，这次转换就不再是「最近一次操作」，撤销记录作废
-      ta.addEventListener('input', function () { self._rec = null; });
-    }
+      ta.addEventListener('input', function () {
+        if (self._internalInput === ta) return;
+        self.bumpVersion(ta);
+        self.invalidateUndo(ta);
+      });
+    });
   },
 
-  /* ---------- 文件名（官方算法逐字对应） ---------- */
+  /* ---------- 文件名（官方算法） ---------- */
   txtName: function (text) {
-    // v5 = 字母或数字、且不是 CJK/泰文等——官方用它判断「是否处在词中间」
     var RE_WORD = /[\p{L}\p{N}]/u;
     var RE_NON_LATIN = /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Thai}\p{sc=Lao}\p{sc=Khmer}\p{sc=Myanmar}]/u;
     var isWord = function (ch) { return !!ch && RE_WORD.test(ch) && !RE_NON_LATIN.test(ch); };
-    var RE_BAD = /[\\/:*?"<>|\x00-\x1f]/g;   // v8：文件名非法字符
-    var n = text.search(/\r|\n/);
-    var first = n === -1 ? text : text.slice(0, n);
+    var RE_BAD = /[\\/:*?"<>|\x00-\x1f]/g;
+    var newline = text.search(/\r|\n/);
+    var first = newline === -1 ? text : text.slice(0, newline);
     if (first.length > 50) {
       var cut = 50;
-      // 第 50 个字符和被挤掉的第 51 个都是 ASCII 词字符 → 说明切在了词中间，
-      // 往前退到词边界
       if (isWord(first[49]) && isWord(first[50])) {
-        var t = 50;
-        while (t > 0 && isWord(first[t - 1])) t -= 1;
-        if (t > 0) cut = t;
+        var at = 50;
+        while (at > 0 && isWord(first[at - 1])) at -= 1;
+        if (at > 0) cut = at;
       }
       first = first.slice(0, cut);
     }
-    var s = first.replace(RE_BAD, '').replace(/\s+/g, ' ').trim();
-    return (s || this.fallbackName()) + '.txt';
+    var name = first.replace(RE_BAD, '').replace(/\s+/g, ' ').trim();
+    return (name || this.fallbackName()) + '.txt';
   },
 
   fallbackName: function () {
-    // 官方回退名按页面语言取值：粘贴的文本 / Pasted text
     var lang = '';
     try { lang = localStorage.getItem('latestReminderLanguage') || navigator.language || ''; } catch (e) {}
     return /^zh/i.test(lang) ? '粘贴的文本' : 'Pasted text';
   },
 
   init: function () {
-    // 主站原生就有这功能，只补 demo 页
     if (location.hostname !== 'cdn.deepseek.com') return;
+    if (this._inited) return;
+    this._inited = true;
     var self = this;
-    Utils.onReady(function () { self.bind(); });
-    // 输入框随会话切换重建——节流（带前缘）兜底自愈，不用防抖（连续 DOM
-    // 变动会把防抖一直重置，重建后迟迟绑不上）
-    new MutationObserver(Utils.throttle(function () { self.bind(); }, 300))
-      .observe(document.body, { childList: true, subtree: true });
+    Utils.onReady(function () {
+      self.bind();
+      self._observer = UI.observeRelevant(document.body, function () { self.bind(); }, {
+        childList: true,
+        subtree: true
+      });
+    });
+    DCP.on('session:change', function () { self.resetSession(); });
+    DCP.on('session:leave', function () { self.resetSession(); });
+  },
+
+  destroy: function () {
+    if (this._observer) this._observer.disconnect();
+    this._observer = null;
+    this.resetSession();
   }
 };
 DCP.modules.demoPasteTxt = DemoPasteTxt;

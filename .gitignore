@@ -1,4 +1,5 @@
 node_modules/
 _check.js
+.deepseek-unlimited.*.tmp
 *.log
 .DS_Store

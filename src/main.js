@@ -4,7 +4,7 @@
  * 顺序：toolbar（工具条定位，ctxRing/tpsMeter 要用）→ demoapi（设置面板 + fetch 补丁）
  *       → demobridge（工具桥接，由 demoapi 的补丁触发）→ ctxRing（占用环）
  *       → tpsMeter（实时速率）→ demosearch / sessionsync / thinktimer /
- *       codedownload / sessionpin / officialanimations / preview /
+ *       codedownload / sessionpin / continuegen / editcaret / officialanimations / preview /
  *       demopastetxt / tabtitle
  * ============================================================ */
 (function () {
@@ -18,6 +18,8 @@
     'thinkTimer',
     'codeDownload',
     'sessionPin',
+    'continueGen',
+    'editCaret',
     'officialAnimations',
     'preview',
     'demoPasteTxt',
@@ -25,10 +27,13 @@
   ];
   function initModule(name) {
     var m = DCP.modules[name];
-    if (!m || typeof m.init !== 'function') return;
-    if (m._inited) return;
-    m._inited = true;
-    try { m.init(); } catch (e) { console.error('[DCP] init fail:', name, e); }
+    if (!m || typeof m.init !== 'function' || m._inited) return;
+    try {
+      m.init();
+      m._inited = true;
+    } catch (e) {
+      console.error('[DCP] init fail:', name, e);
+    }
   }
   function boot() {
     try {

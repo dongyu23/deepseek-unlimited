@@ -34,7 +34,7 @@ var TpsMeter = {
     var el = document.createElement('div');
     el.id = 'dcp-tps-meter';
     el.setAttribute('role', 'status');
-    el.setAttribute('aria-live', 'polite');
+    el.setAttribute('aria-live', 'off');
     el.style.cssText = 'display:none;align-items:center;justify-content:flex-end;height:24px;' +
       'box-sizing:border-box;padding:0 4px;background:transparent;color:inherit;font-size:11px;line-height:1;' +
       'font-variant-numeric:tabular-nums;white-space:nowrap;flex:0 0 auto;margin:0 4px 0 0;opacity:.72';

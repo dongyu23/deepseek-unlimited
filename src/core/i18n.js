@@ -1,6 +1,6 @@
 /* ============================================================
  * core/i18n：界面中英文（以中文字符串为 key，缺省回退中文）
- *  - lang = auto：按 navigator.language 自动判定（zh* → 中文，其余 → English）
+ *  - lang = auto：优先 document.documentElement.lang，再按 navigator.language 判定
  *  - lang = zh / en：手动覆盖
  *  - 只做中英文；未收录的 key 原样返回中文，保证不出现空串
  * ============================================================ */
@@ -99,7 +99,8 @@ var I18N = {
     '侧栏实时显示生成中的转圈和生成完毕的蓝点；后台标签开着同一条会话时，对方完成后自动同步正文。刷新页面只恢复一次当前会话。': 'Show a spinner while a conversation is generating and a blue dot when it finishes. A background tab viewing the same conversation reloads once after the other tab finishes. Refreshing restores the current conversation once.',
     '正在生成': 'Generating',
     '生成完毕': 'Finished',
-    // 代码下载 / 会话置顶 / 附件预览
+    // 代码下载 / 会话置顶 / 附件预览 / 断流续接
+    '继续生成': 'Continue',
     '下载代码': 'Download code',
     '下载': 'Download',
     '已下载 {name}': 'Downloaded {name}',
@@ -156,6 +157,28 @@ var I18N = {
     '（估算）': ' (estimated)',
     '本会话上下文已使用 {p}%，达到提醒阈值 {t}%，可考虑开启新对话': 'Context usage of this session reached {p}% (warning threshold {t}%). Consider starting a new chat.',
 
+    // ---------- chat-demo 设置 / 保存 / 高级选项补齐 ----------
+    '填 Base URL 或完整地址都认：https://api.stepfun.com/step_plan（文档里的 Base URL）、https://api.stepfun.com/step_plan/v1、或 .../v1/messages，脚本自动补全。留空 = 官方 {base}': 'Enter a base URL or a full URL: https://api.stepfun.com/step_plan (the documented base), https://api.stepfun.com/step_plan/v1, or .../v1/messages. Missing suffixes are added automatically. Leave empty for the official {base}',
+    '模型支持图片（多模态）': 'Model supports images (multimodal)',
+    '开=图片转 base64 内联发送；关=只发「当前模型不支持图片」的文字说明。纯文本模型请关掉，省 token 也避免被端点拒': 'On = send images inline as base64. Off = replace them with a note that the current model does not support images. Turn this off for text-only models to save tokens and avoid endpoint rejections.',
+    '设置改动会自动保存；点此可立即保存并确认。API Key 的保存取决于隔离存储是否可用。': 'Settings are saved automatically. Click to save now and confirm. API key persistence depends on whether isolated storage is available.',
+    '保存': 'Save',
+    '已保存': 'Saved',
+    '已保存 ✓': 'Saved ✓',
+    '保存失败': 'Save failed',
+    '存储写入失败，请检查用户脚本管理器或浏览器存储权限。': 'Could not write to storage. Check the userscript manager or browser storage permissions.',
+    '高级选项': 'Advanced options',
+    '留空 = 官方默认 deepseek-flash；只更换请求中的 model 字段': 'Leave empty for the official default (deepseek-flash). Only the model field in the request is changed.',
+    '所用模型的上下文窗口（tokens）。可填 128000，也可写 128k / 1m。输入框旁的圆圈按 占用/窗口 显示百分比': 'The model context window in tokens. Enter 128000, 128k, or 1m. The ring beside the input shows usage / window as a percentage.',
+    '搜索来源': 'Search source',
+    'auto：DeepSeek 原生搜索': 'auto: DeepSeek native search',
+    'off：用模型自带的': 'off: use the model’s own',
+    'auto=换第三方模型时，搜索仍由 DeepSeek 原生执行、界面原样呈现（推荐）；off=完全使用第三方自己的能力（多数没有搜索）': 'auto = keep DeepSeek native search when using a third-party model, with the same UI (recommended); off = rely entirely on the third-party model’s own capabilities (often unavailable)',
+    'API Key 仅保存在用户脚本管理器的隔离存储中，不会写入页面可读的 localStorage；输入框失焦后立即清空。': 'The API key is stored only in the userscript manager’s isolated storage, never in page-readable localStorage. The input is cleared as soon as it loses focus.',
+    '当前环境未检测到隔离存储，API Key 不会保存到页面存储，仅在当前页面会话内有效；刷新后需重新输入。': 'No isolated storage was detected. The API key will not be written to page storage and is available only for this page session; re-enter it after refreshing.',
+    '连接测试超时，请检查端点或稍后重试。': 'The connection test timed out. Check the endpoint or try again later.',
+    '连接测试失败': 'Connection test failed',
+
     // ---------- 提示词 ----------
     '本会话系统提示词': 'Session system prompt',
     '只对当前这一个会话生效；切换到其它会话互不影响、互不可见。': 'Applies to this session only; each session is independent and private.',
@@ -197,6 +220,7 @@ var I18N = {
     'tokens': 'tokens',
     '统计失败（可能需要联网）': 'Failed (network required?)',
     '已拦截一次撤回，真实内容已本地保留': 'Recall intercepted; content kept locally',
+    '连接中断，已保留生成内容，可点击继续生成': 'Connection interrupted. Generated content was kept; select Continue to resume.',
 
     // ---------- 关于 ----------
     'GitHub 仓库': 'GitHub repo',
@@ -206,11 +230,49 @@ var I18N = {
   resolve: function () {
     var pref = (DCP.config && DCP.config.get('lang')) || 'auto';
     if (pref === 'zh' || pref === 'en') return pref;
-    var nav = String((navigator.language || navigator.userLanguage || 'en')).toLowerCase();
+    var docLang = '';
+    try { docLang = document.documentElement && document.documentElement.lang; } catch (e) {}
+    var nav = String(docLang || navigator.language || navigator.userLanguage || 'en').toLowerCase();
     return nav.indexOf('zh') === 0 ? 'zh' : 'en';
   },
-  lang: function () { if (!this._lang) this._lang = this.resolve(); return this._lang; },
-  refresh: function () { this._lang = this.resolve(); return this._lang; },
+  lang: function () {
+    if (!this._lang) this._lang = this.resolve();
+    return this._lang;
+  },
+  apply: function (root) {
+    try {
+      root = root || document;
+      if (!root || !root.querySelectorAll) return;
+      var attrMap = {
+        'data-i18n': 'textContent',
+        'data-i18n-title': 'title',
+        'data-i18n-placeholder': 'placeholder',
+        'data-i18n-aria-label': 'aria-label'
+      };
+      Object.keys(attrMap).forEach(function (attr) {
+        var prop = attrMap[attr];
+        Array.prototype.forEach.call(root.querySelectorAll('[' + attr + ']'), function (el) {
+          var key = el.getAttribute(attr);
+          if (!key) return;
+          var value = I18N.t(key);
+          if (prop === 'textContent') {
+            if (DCP.utils && typeof DCP.utils.setTextIfChanged === 'function') DCP.utils.setTextIfChanged(el, value);
+            else if (el.textContent !== value) el.textContent = value;
+          } else if (prop === 'aria-label') {
+            if (el.getAttribute(prop) !== value) el.setAttribute(prop, value);
+          } else if (el[prop] !== value) {
+            el[prop] = value;
+          }
+        });
+      });
+    } catch (e) {}
+  },
+  refresh: function () {
+    this._lang = this.resolve();
+    this.apply();
+    try { DCP.emit('i18n:change', { lang: this._lang }); } catch (e) {}
+    return this._lang;
+  },
   t: function (key, params) {
     var l = this.lang();
     var d = this.dict;
@@ -226,3 +288,8 @@ var I18N = {
 DCP.i18n = I18N;
 DCP.t = function (k, p) { return I18N.t(k, p); };
 DCP.register('i18n', I18N);
+DCP.on('cfg:change', function () { I18N.refresh(); });
+if (typeof document !== 'undefined') {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { I18N.refresh(); });
+  else I18N.refresh();
+}
